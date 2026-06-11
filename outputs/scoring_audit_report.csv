@@ -1,0 +1,7 @@
+check,passed,detail
+station_rows_available,True,stations=57
+priority_score_not_null,True,final_priority_score computed for all stations
+coordinates_valid,True,station coordinates available
+mismatch_class_available,True,demand-service mismatch classes generated
+mclp_signal_available,True,MCLP candidate score attached
+weight_sum_valid,True,scoring weights sum to 1.0

@@ -1,0 +1,6 @@
+check,passed,detail
+simulation_rows_created,True,rows=285
+best_interventions_available,True,rows=57
+lmci_gain_positive,True,all lmci gains are non-negative
+ridership_gain_positive,True,all ridership gains are non-negative
+scenario_diversity,True,unique scenarios=5

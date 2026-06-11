@@ -1,0 +1,57 @@
+project:
+  name: Hyderabad Metro Last-Mile Intelligence Platform
+  city: Hyderabad
+
+paths:
+  data_dir: data
+  outputs_dir: outputs
+  assets_dir: assets
+
+spatial:
+  walk_radius_m: 800
+  feeder_radius_m: 3000
+  detour_factor: 1.35
+
+crs:
+  wgs84: 4326
+  metric: 32644
+
+time_windows:
+  - [7.0, 10.0, "Morning"]
+  - [11.0, 14.0, "Midday"]
+  - [17.0, 21.0, "Evening"]
+
+lmci:
+  baseline:
+    density: 0.50
+    frequency: 0.40
+    walkzone: 0.10
+
+  demand_augmented:
+    density: 0.35
+    frequency: 0.35
+    walkzone: 0.15
+    demand: 0.15
+
+mclp:
+  coverage_radius_m: 800
+  default_k: 5
+  max_k: 10
+
+scoring:
+  weight_lmci_gap: 0.30
+  weight_demand: 0.25
+  weight_mclp: 0.25
+  weight_temporal_gap: 0.10
+  weight_desert: 0.10
+
+simulation:
+  base_ridership_gain_factor: 0.08
+  feeder_bonus_factor: 0.12
+  multimodal_bonus_factor: 0.10
+  temporal_stability_factor: 0.06
+  desert_recovery_factor: 0.15
+
+classification:
+  high_quantile: 0.67
+  low_quantile: 0.33
