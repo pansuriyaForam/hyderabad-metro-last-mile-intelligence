@@ -1,888 +1,1882 @@
-# ── stdlib ────────────────────────────────────────────────────────────────────
-import logging
-import sys
-from pathlib import Path
-from dataclasses import dataclass, field
-from typing import List, Optional
+"""
+Hyderabad Metro Last-Mile Intelligence Platform
+================================================
+Premium urban mobility intelligence dashboard.
+Reads pre-computed outputs only — does NOT regenerate analytics.
 
-# ── third-party ───────────────────────────────────────────────────────────────
-import numpy as np
-import pandas as pd
-import geopandas as gpd
+Run:
+    streamlit run app.py
+"""
+
+import warnings
+warnings.filterwarnings("ignore")
+
 import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
 import plotly.graph_objects as go
-from scipy.spatial import cKDTree
-
-
-logging.basicConfig(
-    level=logging.WARNING,          # keep Streamlit console clean
-    format="%(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("app")
-
-# ── Config ────────────────────────────────────────────────────────────────────
-# (verbatim from corrected notebook Cell 3)
-
-@dataclass
-class Config:
-    hmrl_dir:   Path = field(default_factory=lambda: Path("Data/hmrl"))
-    tgsrtc_dir: Path = field(default_factory=lambda: Path("Data/tgsrtc"))
-    visuals_dir: Path = field(default_factory=lambda: Path("visuals"))
-
-    utm_crs:         int   = 32644
-    wgs84_crs:       int   = 4326
-    walk_radius_m:   float = 800.0
-    feeder_radius_m: float = 3000.0
-    detour_factor:   float = 1.35
-
-    bbox_lat_min: float = 17.20
-    bbox_lat_max: float = 17.65
-    bbox_lon_min: float = 78.20
-    bbox_lon_max: float = 78.75
-
-    peak_start: str = "07:00:00"
-    peak_end:   str = "10:00:00"
-    peak_hours: float = 3.0
-
-    w_density:   float = 0.50
-    w_frequency: float = 0.40
-    w_walkzone:  float = 0.10
-
-    mclp_budget:            int   = 10
-    mclp_candidate_grid_m:  float = 500.0
-    mclp_desert_grid_m:     float = 250.0
-    mclp_coverage_radius_m: float = 800.0
-
-    equity_desert_threshold:  float = 4.0
-    equity_desert_budget_pct: float = 0.5
-    equity_lmci_weight_eps:   float = 0.5
-
-    export_dpi: int = 300
-
-    red_line_stop_ids: List[str] = field(default_factory=lambda: [
-        "MYP", "JNT", "KPH", "KUK", "BLR", "MSP", "BTN", "ERA", "ESI", "SRN",
-        "AME", "PUN", "IRM", "KHA", "LKP", "ASM", "NAM", "GAB", "OMC", "MGB",
-        "MKL", "NEM", "MSB", "DSN", "CHP", "VOM", "LBN"
-    ])
-
-    red_line_name_map: dict = field(default_factory=lambda: {
-        "Balanagar": "Balanagar (Dr.B.R. Ambedkar Balanagar)",
-        "S. R. Nagar": "S.R. Nagar",
-        "Panjagutta": "Punjagutta",
-        "Erra Manzil": "Irrum Manzil",
-        "Mahatma Gandhi Bus Station": "MG Bus Station",
-        "Dilsukh Nagar": "Dilsukhnagar",
-        "L. B. Nagar": "LB Nagar",
-    })
-
-    def __post_init__(self) -> None:
-        self.visuals_dir.mkdir(parents=True, exist_ok=True)
-        assert abs(self.w_density + self.w_frequency + self.w_walkzone - 1.0) < 1e-9
-
-
-CFG = Config()
-
-# ── GTFSLoader ────────────────────────────────────────────────────────────────
-# (verbatim from corrected notebook Cell 4)
-
-class GTFSLoader:
-    HMRL_FILES   = ["stops.txt"]
-    TGSRTC_FILES = ["stops.txt", "stop_times.txt", "trips.txt", "routes.txt"]
-
-    def __init__(self, cfg: Config) -> None:
-        self.cfg = cfg
-        self._log = logging.getLogger("GTFSLoader")
-
-    def _validate_files(self, directory: Path, required: List[str]) -> None:
-        missing = [f for f in required if not (directory / f).exists()]
-        if missing:
-            raise FileNotFoundError(
-                f"Missing GTFS files in '{directory}': {missing}\n"
-                f"Download from: https://data.telangana.gov.in"
-            )
-
-    def _bbox_filter(self, df: pd.DataFrame, label: str) -> pd.DataFrame:
-        c = self.cfg
-        mask = (
-            df["stop_lat"].between(c.bbox_lat_min, c.bbox_lat_max) &
-            df["stop_lon"].between(c.bbox_lon_min, c.bbox_lon_max)
-        )
-        return df[mask].reset_index(drop=True)
-
-    def _load_csv(self, path: Path, **kwargs) -> pd.DataFrame:
-        return pd.read_csv(path, low_memory=False, **kwargs)
-
-    def load_metro_stops(self) -> pd.DataFrame:
-        self._validate_files(self.cfg.hmrl_dir, self.HMRL_FILES)
-        df = self._load_csv(self.cfg.hmrl_dir / "stops.txt")
-        df.columns = df.columns.str.strip().str.lower()
-        df["stop_lat"] = pd.to_numeric(df["stop_lat"], errors="coerce")
-        df["stop_lon"] = pd.to_numeric(df["stop_lon"], errors="coerce")
-        df["location_type"] = pd.to_numeric(df["location_type"], errors="coerce")
-        df = df.dropna(subset=["stop_lat", "stop_lon"])
-        df = self._bbox_filter(df, "HMRL stops")
-
-        df = df[df["location_type"] == 1].copy()
-        _access_pattern = r"Arm|Lift|Escalator|Staircase|Combined Staircase"
-        df = df[~df["stop_name"].str.contains(_access_pattern, case=False, na=False)].copy()
-
-        red_line = df[df["stop_id"].isin(self.cfg.red_line_stop_ids)].copy()
-        red_line["stop_name"] = red_line["stop_name"].replace(self.cfg.red_line_name_map)
-        return red_line[["stop_id", "stop_name", "stop_lat", "stop_lon"]].reset_index(drop=True)
-
-    def load_bus_stops(self) -> pd.DataFrame:
-        self._validate_files(self.cfg.tgsrtc_dir, self.TGSRTC_FILES)
-        df = self._load_csv(self.cfg.tgsrtc_dir / "stops.txt")
-        df.columns = df.columns.str.strip().str.lower()
-        df["stop_lat"] = pd.to_numeric(df["stop_lat"], errors="coerce")
-        df["stop_lon"] = pd.to_numeric(df["stop_lon"], errors="coerce")
-        df = df.dropna(subset=["stop_lat", "stop_lon"])
-        df = self._bbox_filter(df, "TGSRTC stops")
-        return df[["stop_id", "stop_name", "stop_lat", "stop_lon"]].reset_index(drop=True)
-
-    def load_stop_times(self) -> pd.DataFrame:
-        df = self._load_csv(self.cfg.tgsrtc_dir / "stop_times.txt")
-        df.columns = df.columns.str.strip().str.lower()
-        return df
-
-
-# ── Fallback data (from notebook Cell 5) ─────────────────────────────────────
-# Paste _make_fallback_metro() and _make_fallback_bus() here verbatim.
-# They are used when live GTFS files are absent so the app still runs.
-# Below is the canonical fallback from the notebook:
-
-def _make_fallback_metro() -> pd.DataFrame:
-    STATIONS = [
-        {"stop_id": "MYP", "stop_name": "Miyapur",                              "stop_lat": 17.4950, "stop_lon": 78.3490},
-        {"stop_id": "JNT", "stop_name": "JNTU College",                         "stop_lat": 17.4930, "stop_lon": 78.3600},
-        {"stop_id": "KPH", "stop_name": "KPHB Colony",                          "stop_lat": 17.4910, "stop_lon": 78.3730},
-        {"stop_id": "KUK", "stop_name": "Kukatpally",                           "stop_lat": 17.4870, "stop_lon": 78.3910},
-        {"stop_id": "BLR", "stop_name": "Balanagar (Dr.B.R. Ambedkar Balanagar)","stop_lat": 17.4780, "stop_lon": 78.4030},
-        {"stop_id": "MSP", "stop_name": "Moosapet",                             "stop_lat": 17.4710, "stop_lon": 78.4160},
-        {"stop_id": "BTN", "stop_name": "Bharat Nagar",                         "stop_lat": 17.4660, "stop_lon": 78.4280},
-        {"stop_id": "ERA", "stop_name": "Erragadda",                            "stop_lat": 17.4610, "stop_lon": 78.4360},
-        {"stop_id": "ESI", "stop_name": "ESI Hospital",                         "stop_lat": 17.4560, "stop_lon": 78.4430},
-        {"stop_id": "SRN", "stop_name": "S.R. Nagar",                           "stop_lat": 17.4510, "stop_lon": 78.4500},
-        {"stop_id": "AME", "stop_name": "Ameerpet",                             "stop_lat": 17.4378, "stop_lon": 78.4480},
-        {"stop_id": "PUN", "stop_name": "Punjagutta",                           "stop_lat": 17.4284, "stop_lon": 78.4484},
-        {"stop_id": "IRM", "stop_name": "Irrum Manzil",                         "stop_lat": 17.4210, "stop_lon": 78.4490},
-        {"stop_id": "KHA", "stop_name": "Khairatabad",                          "stop_lat": 17.4155, "stop_lon": 78.4500},
-        {"stop_id": "LKP", "stop_name": "Lakdi-ka-pul",                         "stop_lat": 17.4080, "stop_lon": 78.4530},
-        {"stop_id": "ASM", "stop_name": "Assembly",                             "stop_lat": 17.4020, "stop_lon": 78.4560},
-        {"stop_id": "NAM", "stop_name": "Nampally",                             "stop_lat": 17.3950, "stop_lon": 78.4630},
-        {"stop_id": "GAB", "stop_name": "Gandhi Bhavan",                        "stop_lat": 17.3900, "stop_lon": 78.4680},
-        {"stop_id": "OMC", "stop_name": "Osmania Medical College",              "stop_lat": 17.3840, "stop_lon": 78.4740},
-        {"stop_id": "MGB", "stop_name": "MG Bus Station",                       "stop_lat": 17.3790, "stop_lon": 78.4800},
-        {"stop_id": "MKL", "stop_name": "Malakpet",                             "stop_lat": 17.3740, "stop_lon": 78.4870},
-        {"stop_id": "NEM", "stop_name": "New Market",                           "stop_lat": 17.3680, "stop_lon": 78.4920},
-        {"stop_id": "MSB", "stop_name": "Musarambagh",                          "stop_lat": 17.3620, "stop_lon": 78.4960},
-        {"stop_id": "DSN", "stop_name": "Dilsukhnagar",                         "stop_lat": 17.3680, "stop_lon": 78.5260},
-        {"stop_id": "CHP", "stop_name": "Chaitanyapuri",                        "stop_lat": 17.3630, "stop_lon": 78.5360},
-        {"stop_id": "VOM", "stop_name": "Victoria Memorial",                    "stop_lat": 17.3580, "stop_lon": 78.5450},
-        {"stop_id": "LBN", "stop_name": "LB Nagar",                             "stop_lat": 17.3490, "stop_lon": 78.5520},
-    ]
-    return pd.DataFrame(STATIONS)
-
-
-def _make_fallback_bus(rng: np.random.Generator) -> tuple:
-    """Generate calibrated synthetic TGSRTC data when live GTFS is absent."""
-    # ~3 000 bus stops distributed across the Red Line corridor
-    n = 3000
-    lats = rng.uniform(17.34, 17.50, n)
-    lons = rng.uniform(78.34, 78.56, n)
-    stop_ids = [f"BUS{i:05d}" for i in range(n)]
-    bus_df = pd.DataFrame({
-        "stop_id": stop_ids,
-        "stop_name": [f"Bus Stop {i}" for i in range(n)],
-        "stop_lat": lats,
-        "stop_lon": lons,
-    })
-    # Synthetic stop_times: 20 trips per stop during 07–10
-    trip_ids  = [f"T{i:04d}" for i in range(200)]
-    stop_time_rows = []
-    for sid in stop_ids[:500]:          # keep synthetic data small
-        for t in rng.choice(trip_ids, size=5, replace=False):
-            hr  = rng.integers(7, 10)
-            mn  = rng.integers(0, 60)
-            stop_time_rows.append({
-                "trip_id": t,
-                "stop_id": sid,
-                "departure_time": f"{hr:02d}:{mn:02d}:00",
-                "arrival_time":   f"{hr:02d}:{mn:02d}:00",
-            })
-    stop_times = pd.DataFrame(stop_time_rows)
-    return bus_df, stop_times
-
-
-# ── TransitOptimizer ──────────────────────────────────────────────────────────
-
-class TransitOptimizer:
-    def __init__(self, cfg: Config) -> None:
-        self.cfg  = cfg
-        self._log = logging.getLogger("TransitOptimizer")
-        self.gdf_metro:       Optional[gpd.GeoDataFrame] = None
-        self.gdf_bus:         Optional[gpd.GeoDataFrame] = None
-        self.gdf_lmci:        Optional[gpd.GeoDataFrame] = None
-        self.mclp_report:     Optional[pd.DataFrame]     = None
-        self._stop_times_raw: Optional[pd.DataFrame]     = None
-        self._fallback_mode:  bool = False
-        self._selected_mclp_xy: list = []
-
-    @staticmethod
-    def _to_gdf(df, lat_col="stop_lat", lon_col="stop_lon", crs_out=32644):
-        gdf = gpd.GeoDataFrame(
-            df.copy(),
-            geometry=gpd.points_from_xy(df[lon_col], df[lat_col]),
-            crs="EPSG:4326",
-        )
-        return gdf.to_crs(epsg=crs_out)
-
-    @staticmethod
-    def _minmax_norm(series):
-        rng = series.max() - series.min()
-        return (series - series.min()) / rng if rng > 0 else pd.Series(
-            np.zeros(len(series)), index=series.index
-        )
-
-    def build(self, metro_df, bus_df, stop_times, fallback=False):
-        self._fallback_mode  = fallback
-        self._stop_times_raw = stop_times.copy()
-        self.gdf_metro = self._to_gdf(metro_df, crs_out=self.cfg.utm_crs)
-        self.gdf_bus   = self._to_gdf(bus_df,   crs_out=self.cfg.utm_crs)
-
-        metro_xy = np.column_stack([self.gdf_metro.geometry.x, self.gdf_metro.geometry.y])
-        bus_xy   = np.column_stack([self.gdf_bus.geometry.x,   self.gdf_bus.geometry.y])
-
-        tree = cKDTree(metro_xy)
-        dist_euc, idx = tree.query(bus_xy, k=1, workers=-1)
-        dist_net = dist_euc * self.cfg.detour_factor
-
-        self.gdf_bus = self.gdf_bus.copy()
-        self.gdf_bus["nearest_metro_idx"] = idx
-        self.gdf_bus["nearest_metro_id"]  = self.gdf_metro.iloc[idx]["stop_id"].values
-        self.gdf_bus["dist_to_metro_m"]   = dist_net
-        self.gdf_bus["in_walk_zone"]       = dist_net <= self.cfg.walk_radius_m
-        self.gdf_bus["in_feeder_zone"]     = dist_net <= self.cfg.feeder_radius_m
-        return self
-
-    def compute_peak_frequency(self):
-        st = self._stop_times_raw.copy()
-        if "departure_time" not in st.columns and "arrival_time" in st.columns:
-            st["departure_time"] = st["arrival_time"]
-
-        def _parse(t):
-            try:
-                p = str(t).split(":")
-                return int(p[0]) + int(p[1]) / 60.0 + int(p[2]) / 3600.0
-            except Exception:
-                return None
-
-        st["dep_hr"] = st["departure_time"].apply(_parse)
-        st = st.dropna(subset=["dep_hr"])
-        peak = st[st["dep_hr"].between(7.0, 10.0)]
-
-        freq = (
-            peak.groupby("stop_id")["trip_id"]
-            .nunique()
-            .div(self.cfg.peak_hours)
-            .rename("peak_freq")
-            .reset_index()
-        )
-        self.gdf_bus = self.gdf_bus.merge(freq, on="stop_id", how="left")
-        self.gdf_bus["peak_freq"] = self.gdf_bus["peak_freq"].fillna(0.0)
-        return self
-
-    def compute_lmci(self):
-        feeder = self.gdf_bus[self.gdf_bus["in_feeder_zone"]].copy()
-
-        metrics = feeder.groupby("nearest_metro_id").agg(
-            stop_count_3km  = ("stop_id",        "count"),
-            avg_peak_freq   = ("peak_freq",       "mean"),
-            stop_count_800m = ("in_walk_zone",    "sum"),
-            avg_dist_m      = ("dist_to_metro_m", "mean"),
-        ).reset_index().rename(columns={"nearest_metro_id": "stop_id"})
-
-        gdf = self.gdf_metro.merge(metrics, on="stop_id", how="left").fillna(0)
-
-        gdf["norm_density"]   = self._minmax_norm(gdf["stop_count_3km"].astype(float))
-        gdf["norm_frequency"] = self._minmax_norm(gdf["avg_peak_freq"].astype(float))
-        gdf["norm_walkzone"]  = self._minmax_norm(gdf["stop_count_800m"].astype(float))
-
-        cfg = self.cfg
-        gdf["LMCI"] = 10.0 * (
-            cfg.w_density   * gdf["norm_density"]   +
-            cfg.w_frequency * gdf["norm_frequency"]  +
-            cfg.w_walkzone  * gdf["norm_walkzone"]
-        )
-
-        def _cat(v):
-            if v >= 7:  return "Well-Connected"
-            if v >= 4:  return "Moderate"
-            return "Transit Desert"
-
-        gdf["category"] = gdf["LMCI"].apply(_cat)
-        self.gdf_lmci = gdf
-        return self
-
-    def run_greedy_mclp(self):
-        """Equity-weighted MCLP — paste full method from notebook Cell 6."""
-        # ── Minimal version (produces LMCI_after / LMCI_improvement) ─────
-        feeder = self.gdf_bus[self.gdf_bus["in_feeder_zone"]].copy()
-        demand_xy = np.column_stack([feeder.geometry.x, feeder.geometry.y])
-
-        # Equity weight per demand point: inversely proportional to nearest
-        # station's LMCI (poorer connectivity = higher weight)
-        eps = self.cfg.equity_lmci_weight_eps
-        lmci_map = self.gdf_lmci.set_index("stop_id")["LMCI"].to_dict()
-        feeder["lmci_nearest"] = feeder["nearest_metro_id"].map(lmci_map).fillna(5.0)
-        feeder["eq_weight"]    = 1.0 / (feeder["lmci_nearest"] + eps)
-
-        # Build candidate grid
-        x_min, y_min = demand_xy.min(axis=0)
-        x_max, y_max = demand_xy.max(axis=0)
-        s = self.cfg.mclp_candidate_grid_m
-        xs = np.arange(x_min, x_max + s, s)
-        ys = np.arange(y_min, y_max + s, s)
-        gx, gy = np.meshgrid(xs, ys)
-        candidates = np.column_stack([gx.ravel(), gy.ravel()])
-
-        demand_tree = cKDTree(demand_xy)
-        cov_r = self.cfg.mclp_coverage_radius_m
-        cand_coverage = demand_tree.query_ball_point(candidates, r=cov_r)
-
-        total_weight  = feeder["eq_weight"].sum()
-        eq_weights    = feeder["eq_weight"].values
-        covered       = np.zeros(len(feeder), dtype=bool)
-        selected_xy   = []
-        report_rows   = []
-
-        desert_ids = set(
-            self.gdf_lmci.loc[
-                self.gdf_lmci["LMCI"] < self.cfg.equity_desert_threshold, "stop_id"
-            ]
-        )
-        desert_budget = max(1, int(self.cfg.mclp_budget * self.cfg.equity_desert_budget_pct))
-
-        for step in range(1, self.cfg.mclp_budget + 1):
-            desert_remaining = max(0, desert_budget - len(selected_xy))
-            best_gain, best_idx = -1.0, -1
-            for j, pts in enumerate(cand_coverage):
-                gain = sum(eq_weights[p] for p in pts if not covered[p])
-                if gain > best_gain:
-                    best_gain, best_idx = gain, j
-            if best_gain <= 0:
-                break
-
-            # Mark covered
-            for p in cand_coverage[best_idx]:
-                covered[p] = True
-
-            xy = candidates[best_idx]
-            selected_xy.append(xy)
-
-            pct_cov = covered.sum() / len(feeder) * 100
-            pct_wcov = (eq_weights[covered].sum() / total_weight * 100)
-            report_rows.append({
-                "step":              step,
-                "candidate_lat":     0.0,   # placeholder; compute if needed
-                "candidate_lon":     0.0,
-                "weighted_gain":     best_gain,
-                "pct_weighted_cov":  pct_wcov,
-                "pct_improvement":   pct_wcov - (report_rows[-1]["pct_weighted_cov"] if report_rows else 0),
-            })
-
-        self.mclp_report     = pd.DataFrame(report_rows)
-        self._selected_mclp_xy = selected_xy
-
-        # ── Recompute LMCI_after ──────────────────────────────────────────
-        self.gdf_bus = self.gdf_bus.copy()
-        self.gdf_bus["covered_by_mclp"] = False
-        self.gdf_bus.loc[feeder.index, "covered_by_mclp"] = covered
-
-        feeder_after = self.gdf_bus[self.gdf_bus["in_feeder_zone"]].copy()
-        metrics_after = feeder_after.groupby("nearest_metro_id").agg(
-            stop_count_3km_after  = ("stop_id",           "count"),
-            avg_peak_freq_after   = ("peak_freq",          "mean"),
-            stop_count_800m_after = ("in_walk_zone",       "sum"),
-        ).reset_index().rename(columns={"nearest_metro_id": "stop_id"})
-
-        # Bonus: MCLP-covered demand points virtually added to walk zone
-        mclp_bonus = (
-            feeder_after[feeder_after["covered_by_mclp"]]
-            .groupby("nearest_metro_id")
-            .size()
-            .rename("mclp_bonus")
-            .reset_index()
-            .rename(columns={"nearest_metro_id": "stop_id"})
-        )
-        metrics_after = metrics_after.merge(mclp_bonus, on="stop_id", how="left")
-        metrics_after["mclp_bonus"] = metrics_after["mclp_bonus"].fillna(0)
-        metrics_after["stop_count_800m_after"] += metrics_after["mclp_bonus"] * 0.5
-
-        gdf = self.gdf_lmci.merge(metrics_after, on="stop_id", how="left").fillna(0)
-
-        for col in ["stop_count_3km_after", "avg_peak_freq_after", "stop_count_800m_after"]:
-            if col not in gdf.columns:
-                gdf[col] = gdf[col.replace("_after", "")]
-
-        gdf["norm_density_after"]   = self._minmax_norm(gdf["stop_count_3km_after"].astype(float))
-        gdf["norm_frequency_after"] = self._minmax_norm(gdf["avg_peak_freq_after"].astype(float))
-        gdf["norm_walkzone_after"]  = self._minmax_norm(gdf["stop_count_800m_after"].astype(float))
-
-        cfg = self.cfg
-        gdf["LMCI_after"] = 10.0 * (
-            cfg.w_density   * gdf["norm_density_after"]   +
-            cfg.w_frequency * gdf["norm_frequency_after"]  +
-            cfg.w_walkzone  * gdf["norm_walkzone_after"]
-        )
-        gdf["LMCI_improvement"] = gdf["LMCI_after"] - gdf["LMCI"]
-        self.gdf_lmci = gdf
-        return self
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. PIPELINE — cached so Streamlit only runs it once per session
-# ─────────────────────────────────────────────────────────────────────────────
-
-@st.cache_resource(show_spinner="Running pipeline…")
-def run_pipeline() -> tuple[pd.DataFrame, bool]:
-    """
-    Load data → build → LMCI → MCLP.
-    Returns (gdf_lmci as plain DataFrame, fallback_mode flag).
-    """
-    loader   = GTFSLoader(CFG)
-    rng      = np.random.default_rng(42)
-    fallback = False
-
-    try:
-        metro_df = loader.load_metro_stops()
-    except FileNotFoundError:
-        metro_df = _make_fallback_metro()
-        fallback = True
-
-    try:
-        bus_df     = loader.load_bus_stops()
-        stop_times = loader.load_stop_times()
-    except FileNotFoundError:
-        bus_df, stop_times = _make_fallback_bus(rng)
-        fallback = True
-
-    opt = (
-        TransitOptimizer(CFG)
-        .build(metro_df, bus_df, stop_times, fallback=fallback)
-        .compute_peak_frequency()
-        .compute_lmci()
-        .run_greedy_mclp()
-    )
-
-    # Return plain DataFrame (GeoDataFrame not pickle-safe across Streamlit reruns)
-    df = pd.DataFrame(opt.gdf_lmci.drop(columns=["geometry"], errors="ignore"))
-    return df, fallback
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-CAT_COLOURS = {
-    "Well-Connected": "#2ecc71",
-    "Moderate":       "#f39c12",
-    "Transit Desert": "#e74c3c",
-}
-
-def category_badge(cat: str) -> str:
-    colour = CAT_COLOURS.get(cat, "#888")
-    return (
-        f'<span style="background:{colour};color:#fff;padding:3px 10px;'
-        f'border-radius:12px;font-size:0.82rem;font-weight:600">{cat}</span>'
-    )
-
-def lmci_gauge(value: float, label: str, colour: str):
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=round(value, 2),
-        number={"suffix": " / 10", "font": {"size": 26, "color": colour}},
-        title={"text": label, "font": {"size": 13}},
-        gauge={
-            "axis": {"range": [0, 10], "tickwidth": 1, "tickcolor": "#ccc"},
-            "bar":  {"color": colour, "thickness": 0.28},
-            "bgcolor": "#f0f2f6",
-            "borderwidth": 0,
-            "steps": [
-                {"range": [0, 4], "color": "#fdecea"},
-                {"range": [4, 7], "color": "#fff8e1"},
-                {"range": [7, 10],"color": "#e8f8f0"},
-            ],
-            "threshold": {
-                "line": {"color": colour, "width": 3},
-                "thickness": 0.8,
-                "value": value,
-            },
-        },
-    ))
-    fig.update_layout(
-        height=200,
-        margin=dict(t=40, b=10, l=10, r=10),
-        paper_bgcolor="rgba(0,0,0,0)",
-        font_color="#2c3e50",
-    )
-    return fig
-
-
-def before_after_bar(row_a: pd.Series, row_b: Optional[pd.Series] = None):
-    """
-    Grouped bar chart: before / after LMCI for one or two stations.
-    """
-    stations = [row_a["stop_name"]]
-    befores  = [row_a["LMCI"]]
-    afters   = [row_a["LMCI_after"]]
-
-    if row_b is not None:
-        stations.append(row_b["stop_name"])
-        befores.append(row_b["LMCI"])
-        afters.append(row_b["LMCI_after"])
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        name="Before MCLP",
-        x=stations,
-        y=befores,
-        marker_color="#e74c3c",
-        marker_line_color="#c0392b",
-        marker_line_width=1.2,
-        text=[f"{v:.2f}" for v in befores],
-        textposition="outside",
-    ))
-    fig.add_trace(go.Bar(
-        name="After MCLP",
-        x=stations,
-        y=afters,
-        marker_color="#2ecc71",
-        marker_line_color="#27ae60",
-        marker_line_width=1.2,
-        text=[f"{v:.2f}" for v in afters],
-        textposition="outside",
-    ))
-
-    # Threshold lines
-    fig.add_hline(y=4, line_dash="dot", line_color="#e74c3c",
-                  annotation_text="Transit Desert threshold (4)",
-                  annotation_position="top left", annotation_font_size=10)
-    fig.add_hline(y=7, line_dash="dot", line_color="#2ecc71",
-                  annotation_text="Well-Connected threshold (7)",
-                  annotation_position="top left", annotation_font_size=10)
-
-    fig.update_layout(
-        barmode="group",
-        yaxis=dict(range=[0, 11], title="LMCI (0–10)"),
-        xaxis_title="",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font_color="#2c3e50",
-        margin=dict(t=50, b=20, l=10, r=10),
-        height=380,
-    )
-    return fig
-
-
-def all_stations_chart(df: pd.DataFrame, highlight: list[str]):
-    """Horizontal bar of all 27 stations, sorted by LMCI, highlighted."""
-    df_s = df[["stop_name", "LMCI", "LMCI_after", "category"]].sort_values("LMCI").reset_index(drop=True)
-
-    colours = [
-        "#1a73e8" if name in highlight else CAT_COLOURS.get(cat, "#95a5a6")
-        for name, cat in zip(df_s["stop_name"], df_s["category"])
-    ]
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        y=df_s["stop_name"],
-        x=df_s["LMCI"],
-        orientation="h",
-        name="Before",
-        marker_color=colours,
-        opacity=0.55,
-        text=[f"{v:.2f}" for v in df_s["LMCI"]],
-        textposition="outside",
-    ))
-    fig.add_trace(go.Bar(
-        y=df_s["stop_name"],
-        x=df_s["LMCI_after"],
-        orientation="h",
-        name="After",
-        marker_color=colours,
-        opacity=1.0,
-        text=[f"{v:.2f}" for v in df_s["LMCI_after"]],
-        textposition="outside",
-    ))
-    fig.add_vline(x=4, line_dash="dot", line_color="#e74c3c")
-    fig.add_vline(x=7, line_dash="dot", line_color="#2ecc71")
-
-    fig.update_layout(
-        barmode="overlay",
-        xaxis=dict(range=[0, 12], title="LMCI (0–10)"),
-        yaxis_title="",
-        height=max(480, len(df_s) * 22),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font_color="#2c3e50",
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
-        margin=dict(t=30, b=10, l=180, r=80),
-    )
-    return fig
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. PAGE LAYOUT
-# ─────────────────────────────────────────────────────────────────────────────
+from plotly.subplots import make_subplots
+from pathlib import Path
+
+# ─────────────────────────────────────────────────────────────
+# PAGE CONFIG — must be first Streamlit call
+# ─────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="HYD Metro LMCI Explorer",
+    page_title="HYD Metro Accessibility Platform",
     page_icon="🚇",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# DESIGN TOKENS
+# ─────────────────────────────────────────────────────────────
+
+ACCENT   = "#00D4FF"
+CRITICAL = "#FF4B4B"
+HIGH     = "#FF8C00"
+MEDIUM   = "#FFD700"
+LOW      = "#00C48C"
+MUTED    = "#8B9AB2"
+PURPLE   = "#6366F1"
+
+# Metro line colours (Hyderabad HMRL)
+LINE_COLORS = {
+    "Red":   "#E8003D",
+    "Blue":  "#1B4FD8",
+    "Green": "#00843D",
+}
+
+# ─────────────────────────────────────────────────────────────
+# GLOBAL CSS — Premium dark intelligence platform
+# ─────────────────────────────────────────────────────────────
+
 st.markdown("""
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;700&family=DM+Mono&display=swap');
-  html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
-  .metric-card {
-    background: #f8f9fa;
+/* ── Google Font import ── */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* ── Global reset ── */
+*, *::before, *::after { box-sizing: border-box; }
+[data-testid="stAppViewContainer"] {
+    background: #0A0E1A;
+    background-image:
+        radial-gradient(ellipse at 20% 0%, rgba(0,212,255,0.04) 0%, transparent 50%),
+        radial-gradient(ellipse at 80% 100%, rgba(99,102,241,0.04) 0%, transparent 50%);
+}
+[data-testid="stSidebar"] {
+    background: #080C17;
+    border-right: 1px solid rgba(30,42,58,0.8);
+    box-shadow: 4px 0 24px rgba(0,0,0,0.4);
+}
+[data-testid="stHeader"]  { background: transparent; }
+[data-testid="stMainBlockContainer"] { padding-top: 1.5rem; }
+
+/* ── Typography ── */
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+h1 { color: #FFFFFF !important; font-size: 1.55rem !important; font-weight: 800 !important;
+     letter-spacing: -0.03em; margin-bottom: 0 !important; }
+h2 { color: #E2E8F0 !important; font-size: 1.05rem !important; font-weight: 600 !important; letter-spacing: -0.01em; }
+h3 { color: #64748B !important; font-size: 0.72rem !important; font-weight: 600 !important;
+     text-transform: uppercase; letter-spacing: 0.1em; margin: 0; }
+
+/* ── Metric cards — premium ── */
+[data-testid="stMetric"] {
+    background: linear-gradient(135deg, #0F1626 0%, #111827 100%);
+    border: 1px solid #1E2D40;
     border-radius: 12px;
-    padding: 18px 22px;
-    border-left: 5px solid;
-    margin-bottom: 8px;
-  }
-  .metric-card .value {
-    font-size: 2.4rem;
-    font-weight: 700;
-    line-height: 1.1;
-    font-family: 'DM Mono', monospace;
-  }
-  .metric-card .label {
-    font-size: 0.78rem;
-    color: #6c757d;
+    padding: 1rem 1.25rem !important;
+    transition: border-color 0.2s, box-shadow 0.2s;
+    position: relative;
+    overflow: hidden;
+}
+[data-testid="stMetric"]::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(0,212,255,0.3), transparent);
+}
+[data-testid="stMetric"]:hover {
+    border-color: rgba(0,212,255,0.25);
+    box-shadow: 0 0 20px rgba(0,212,255,0.06);
+}
+[data-testid="stMetricLabel"] {
+    color: #475569 !important;
+    font-size: 0.68rem !important;
+    font-weight: 600 !important;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+}
+[data-testid="stMetricValue"] {
+    color: #F1F5F9 !important;
+    font-size: 1.7rem !important;
+    font-weight: 800 !important;
+    font-family: 'Inter', sans-serif;
+    letter-spacing: -0.02em;
+}
+[data-testid="stMetricDelta"] { font-size: 0.75rem !important; font-weight: 600 !important; }
+
+/* ── Containers ── */
+[data-testid="stContainer"] { border-radius: 12px; }
+[data-testid="stVerticalBlock"] > [data-testid="stContainer"][data-border="true"] {
+    background: linear-gradient(135deg, #0D1420 0%, #111827 100%);
+    border: 1px solid #1A2535;
+    border-radius: 14px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.3);
+}
+
+/* ── Tabs ── */
+[data-testid="stTabs"] [data-baseweb="tab-list"] {
+    background: #0D1420;
+    border-radius: 8px;
+    padding: 3px;
+    gap: 2px;
+    border: 1px solid #1E2D40;
+}
+[data-testid="stTabs"] [data-baseweb="tab"] {
+    color: #475569 !important;
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+    border-radius: 6px;
+    padding: 6px 16px !important;
+    letter-spacing: 0.02em;
+}
+[data-testid="stTabs"] [aria-selected="true"] {
+    background: #1E293B !important;
+    color: #00D4FF !important;
+    border-bottom-color: transparent !important;
+}
+
+/* ── Sidebar elements ── */
+[data-testid="stSidebarNav"] { display: none; }
+[data-testid="stRadio"] > label { display: none; }
+[data-testid="stRadio"] [data-testid="stWidgetLabel"] { display: none; }
+
+/* Style radio buttons as nav items */
+[data-testid="stRadio"] > div { gap: 2px !important; }
+[data-testid="stRadio"] label {
+    border-radius: 8px !important;
+    padding: 8px 12px !important;
+    margin: 0 !important;
+    transition: background 0.15s !important;
+    font-size: 0.82rem !important;
+    font-weight: 500 !important;
+    color: #64748B !important;
+    cursor: pointer;
+}
+[data-testid="stRadio"] label:hover { background: rgba(30,41,59,0.6) !important; }
+[data-testid="stRadio"] label[data-checked="true"] {
+    background: rgba(0,212,255,0.08) !important;
+    color: #00D4FF !important;
+    border: 1px solid rgba(0,212,255,0.2) !important;
+}
+/* Hide default radio circles */
+[data-testid="stRadio"] [data-baseweb="radio"] > div:first-child { display: none; }
+
+/* ── Selectbox ── */
+[data-testid="stSelectbox"] > div > div {
+    background: #0D1420;
+    border: 1px solid #1E2D40;
+    border-radius: 8px;
+    color: #E2E8F0;
+}
+
+/* ── DataFrames ── */
+[data-testid="stDataFrame"] {
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid #1A2535;
+}
+[data-testid="stDataFrame"] thead th {
+    background: #0A1020 !important;
+    color: #475569 !important;
+    font-size: 0.7rem !important;
+    font-weight: 700 !important;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    margin-bottom: 4px;
-  }
-  .delta-positive { color: #27ae60; }
-  .delta-negative { color: #e74c3c; }
-  .delta-zero     { color: #95a5a6; }
-  .section-header {
-    font-size: 0.72rem;
+    border-bottom: 1px solid #1E2D40 !important;
+}
+[data-testid="stDataFrame"] tbody tr { transition: background 0.1s; }
+[data-testid="stDataFrame"] tbody tr:hover td { background: #131E30 !important; }
+[data-testid="stDataFrame"] tbody td {
+    color: #CBD5E1 !important;
+    font-size: 0.82rem !important;
+    border-color: #0F1A28 !important;
+}
+
+/* ── Checkboxes ── */
+[data-testid="stCheckbox"] label { color: #94A3B8 !important; font-size: 0.8rem !important; }
+
+/* ── Dividers ── */
+hr { border-color: #1A2535 !important; }
+
+/* ── Download button ── */
+[data-testid="stDownloadButton"] > button {
+    background: transparent;
+    border: 1px solid #1E2D40;
+    color: #64748B;
+    font-size: 0.78rem;
+    border-radius: 8px;
+    padding: 6px 16px;
+    transition: all 0.2s;
+}
+[data-testid="stDownloadButton"] > button:hover {
+    border-color: #00D4FF;
+    color: #00D4FF;
+    background: rgba(0,212,255,0.05);
+}
+
+/* ── Badge pills ── */
+.badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 20px;
+    font-size: 0.68rem;
     font-weight: 700;
-    letter-spacing: 0.12em;
+    letter-spacing: 0.04em;
     text-transform: uppercase;
-    color: #6c757d;
-    margin: 20px 0 8px;
-  }
+}
+.badge-critical { background: rgba(255,75,75,0.12);  color: #FF4B4B; border: 1px solid rgba(255,75,75,0.3); }
+.badge-high     { background: rgba(255,140,0,0.12);  color: #FF8C00; border: 1px solid rgba(255,140,0,0.3); }
+.badge-medium   { background: rgba(255,215,0,0.10);  color: #FFD700; border: 1px solid rgba(255,215,0,0.3); }
+.badge-low      { background: rgba(0,196,140,0.10);  color: #00C48C; border: 1px solid rgba(0,196,140,0.3); }
+.badge-monitor  { background: rgba(139,154,178,0.10); color: #8B9AB2; border: 1px solid rgba(139,154,178,0.3); }
+
+/* ── Insight callout cards ── */
+.insight-card {
+    background: linear-gradient(135deg, rgba(0,212,255,0.05) 0%, rgba(99,102,241,0.03) 100%);
+    border: 1px solid rgba(0,212,255,0.15);
+    border-left: 3px solid #00D4FF;
+    border-radius: 0 10px 10px 0;
+    padding: 0.75rem 1rem;
+    margin: 6px 0;
+    font-size: 0.84rem;
+    color: #CBD5E1;
+    line-height: 1.5;
+}
+.insight-card strong { color: #00D4FF; }
+
+.warning-card {
+    border-left-color: #FF8C00;
+    border-color: rgba(255,140,0,0.15);
+    background: linear-gradient(135deg, rgba(255,140,0,0.04) 0%, transparent 100%);
+}
+.warning-card strong { color: #FF8C00; }
+
+.critical-card {
+    border-left-color: #FF4B4B;
+    border-color: rgba(255,75,75,0.15);
+    background: linear-gradient(135deg, rgba(255,75,75,0.04) 0%, transparent 100%);
+}
+.critical-card strong { color: #FF4B4B; }
+
+/* ── Section headers ── */
+.section-title {
+    font-size: 0.82rem;
+    font-weight: 700;
+    color: #CBD5E1;
+    letter-spacing: 0.01em;
+    margin-bottom: 2px;
+}
+.section-subtitle {
+    font-size: 0.72rem;
+    color: #334155;
+    margin-bottom: 12px;
+}
+
+/* ── Page title block ── */
+.page-title-block {
+    border-bottom: 1px solid #1A2535;
+    padding-bottom: 14px;
+    margin-bottom: 20px;
+}
+.page-eyebrow {
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: #00D4FF;
+    margin-bottom: 4px;
+}
+.page-subtitle {
+    font-size: 0.83rem;
+    color: #475569;
+    margin-top: 4px;
+}
+
+/* ── Station deploy card ── */
+.deploy-card {
+    background: linear-gradient(135deg, #0D1420 0%, #111827 100%);
+    border: 1px solid #1A2535;
+    border-left: 3px solid #FF4B4B;
+    border-radius: 0 10px 10px 0;
+    padding: 10px 16px;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+.deploy-card:hover {
+    border-color: rgba(255,75,75,0.5);
+    box-shadow: 0 2px 16px rgba(255,75,75,0.08);
+}
+.deploy-name { color: #F1F5F9; font-weight: 700; font-size: 0.88rem; }
+.deploy-action { color: #64748B; font-size: 0.78rem; margin-top: 2px; }
+.deploy-score { color: #475569; font-size: 0.76rem; font-family: 'JetBrains Mono', monospace; }
+
+/* ── Ranked station card ── */
+.rank-card {
+    background: #0D1420;
+    border: 1px solid #1A2535;
+    border-radius: 10px;
+    padding: 10px 14px;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    transition: border-color 0.15s;
+}
+.rank-card:hover { border-color: #1E3A5F; }
+.rank-num {
+    font-size: 0.72rem;
+    font-weight: 800;
+    color: #1E3A5F;
+    font-family: 'JetBrains Mono', monospace;
+    width: 28px;
+    text-align: right;
+    flex-shrink: 0;
+}
+.rank-bar-wrap { flex: 1; }
+.rank-name { color: #CBD5E1; font-size: 0.82rem; font-weight: 600; }
+.rank-score { color: #475569; font-size: 0.72rem; font-family: 'JetBrains Mono', monospace; }
+.rank-bar { height: 3px; border-radius: 2px; margin-top: 5px; background: rgba(0,212,255,0.15); position: relative; overflow: hidden; }
+.rank-bar-fill { height: 100%; border-radius: 2px; background: linear-gradient(90deg, #00D4FF, #6366F1); }
+
+/* ── Progress bar ── */
+.prog-bar { height: 4px; background: #1E2D40; border-radius: 2px; overflow: hidden; margin-top: 6px; }
+.prog-fill { height: 100%; border-radius: 2px; }
+
+/* ── Scenario comparison card ── */
+.scenario-card {
+    background: linear-gradient(135deg, #0D1420, #0F1828);
+    border: 1px solid #1A2535;
+    border-radius: 12px;
+    padding: 16px 18px;
+    margin-bottom: 10px;
+    transition: border-color 0.2s, transform 0.15s;
+}
+.scenario-card:hover { border-color: rgba(0,212,255,0.2); transform: translateY(-1px); }
+.scenario-type {
+    font-size: 0.65rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.1em; color: #00D4FF; margin-bottom: 6px;
+}
+.scenario-name { font-size: 0.9rem; font-weight: 700; color: #F1F5F9; }
+.scenario-metrics { display: flex; gap: 20px; margin-top: 10px; }
+.scenario-metric-val { font-size: 1.15rem; font-weight: 800; font-family: 'Inter', sans-serif; }
+.scenario-metric-lbl { font-size: 0.65rem; color: #475569; text-transform: uppercase; letter-spacing: 0.06em; }
+
+/* ── Network impact prose card ── */
+.network-impact {
+    background: #0A1020;
+    border: 1px solid #1A2535;
+    border-radius: 10px;
+    padding: 14px 18px;
+    margin-top: 12px;
+}
+.network-impact-label {
+    color: #334155;
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 8px;
+}
+.network-impact-text {
+    color: #94A3B8;
+    font-size: 0.85rem;
+    line-height: 1.7;
+}
+
+/* ── Map legend pill ── */
+.map-legend {
+    background: rgba(8,12,23,0.92);
+    border: 1px solid #1A2535;
+    border-radius: 10px;
+    padding: 12px 16px;
+    display: inline-block;
+}
+.legend-item { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 0.78rem; color: #94A3B8; }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+
+/* ── Mono values ── */
+.mono { font-family: 'JetBrains Mono', monospace; font-size: 0.82rem; }
+
+/* ── Hide Streamlit chrome ── */
+footer { visibility: hidden; }
+#MainMenu { visibility: hidden; }
+[data-testid="stToolbar"] { display: none; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── Header ────────────────────────────────────────────────────────────────────
-st.markdown("## 🚇 Hyderabad Metro Red Line — Last-Mile Connectivity Explorer")
-st.caption("LMCI Before & After Equity-Weighted MCLP Optimisation · Miyapur ↔ LB Nagar")
+# ─────────────────────────────────────────────────────────────
+# DATA LOADING — cached, robust
+# ─────────────────────────────────────────────────────────────
 
-# ── Run pipeline ──────────────────────────────────────────────────────────────
-with st.spinner("Loading pipeline…"):
-    lmci_df, is_fallback = run_pipeline()
+OUTPUTS = Path("outputs")
 
-if is_fallback:
-    st.warning(
-        "⚠️  Running on **synthetic fallback data** — GTFS files not found at "
-        "`Data/hmrl/` and `Data/tgsrtc/`. LMCI values are illustrative only.",
-        icon="⚠️",
+@st.cache_data(show_spinner=False)
+def _load(filename: str) -> pd.DataFrame | None:
+    path = OUTPUTS / filename
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_csv(path)
+        df.columns = df.columns.str.strip()
+        return df
+    except Exception:
+        return None
+
+
+def load_all():
+    return {
+        "exec_summary":    _load("executive_summary_metrics.csv"),
+        "priority_scores": _load("station_priority_scores.csv"),
+        "mismatch":        _load("demand_service_mismatch.csv"),
+        "insights_top5":   _load("conversion_insights_top5.csv"),
+        "mclp_coverage":   _load("mclp_coverage_by_k.csv"),
+        "mclp_selected":   _load("mclp_selected_stations.csv"),
+        "mclp_candidates": _load("mclp_candidate_scores.csv"),
+        "sim_impacts":     _load("simulation_station_impacts.csv"),
+        "sim_ranking":     _load("simulation_intervention_ranking.csv"),
+        "sim_network":     _load("simulation_network_summary.csv"),
+        "sim_scenarios":   _load("simulation_scenarios.csv"),
+        "station_coords":  _load("station_coordinates.csv"),
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# DESIGN HELPERS
+# ─────────────────────────────────────────────────────────────
+
+PLOTLY_THEME = dict(
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(color="#64748B", family="Inter, sans-serif", size=11),
+    xaxis=dict(gridcolor="#0F1828", linecolor="#1E293B", zerolinecolor="#1E293B",
+               tickfont=dict(size=10, color="#475569")),
+    yaxis=dict(gridcolor="#0F1828", linecolor="#1E293B", zerolinecolor="#1E293B",
+               tickfont=dict(size=10, color="#475569")),
+    legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor="rgba(0,0,0,0)",
+                font=dict(size=10, color="#64748B")),
+    margin=dict(l=4, r=4, t=28, b=4),
+)
+
+
+# ── Plotly layout helpers — prevent duplicate-keyword crashes ──────────────
+def base_layout_without(*keys) -> dict:
+    """Return PLOTLY_THEME with the given top-level keys removed."""
+    return {k: v for k, v in PLOTLY_THEME.items() if k not in keys}
+
+
+def axis_layout(axis_name: str, **overrides) -> dict:
+    """Merge PLOTLY_THEME[axis_name] with caller overrides (no duplication)."""
+    return {**PLOTLY_THEME.get(axis_name, {}), **overrides}
+
+
+def plotly_layout(**overrides) -> dict:
+    """
+    Return a layout dict that is PLOTLY_THEME merged with *overrides*.
+    Keys present in overrides are removed from the base first so that
+    update_layout(**plotly_layout(...)) never receives duplicate kwargs.
+    """
+    base = PLOTLY_THEME.copy()
+    for k in overrides:
+        base.pop(k, None)
+    return {**base, **overrides}
+# ──────────────────────────────────────────────────────────────────────────
+
+COLOR_MAP_BAND = {
+    "Critical": CRITICAL,
+    "High":     HIGH,
+    "Medium":   MEDIUM,
+    "Low":      LOW,
+    "Monitor":  MUTED,
+}
+
+
+def _safe_val(df, col, default=0):
+    if df is None or col not in df.columns:
+        return default
+    v = df[col].iloc[0]
+    return v if pd.notna(v) else default
+
+
+def _fmt_num(n, decimals=0):
+    try:
+        if decimals == 0:
+            return f"{int(round(float(n))):,}"
+        return f"{float(n):,.{decimals}f}"
+    except Exception:
+        return str(n)
+
+
+def section_header(title: str, subtitle: str = ""):
+    st.markdown(
+        f"<div class='section-title'>{title}</div>"
+        + (f"<div class='section-subtitle'>{subtitle}</div>" if subtitle else ""),
+        unsafe_allow_html=True,
     )
 
-station_names = sorted(lmci_df["stop_name"].tolist())
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. SIDEBAR — station selection
-# ─────────────────────────────────────────────────────────────────────────────
+def page_title(eyebrow: str, title: str, subtitle: str):
+    st.markdown(
+        f"<div class='page-title-block'>"
+        f"<div class='page-eyebrow'>{eyebrow}</div>"
+        f"<h1>{title}</h1>"
+        f"<div class='page-subtitle'>{subtitle}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
-with st.sidebar:
-    st.markdown("### 📍 Station Selection")
-    st.markdown('<p class="section-header">Primary station</p>', unsafe_allow_html=True)
-    primary = st.selectbox("Select a station", station_names, index=station_names.index("Ameerpet"))
 
-    st.markdown('<p class="section-header">Compare with (optional)</p>', unsafe_allow_html=True)
-    compare_on = st.checkbox("Enable side-by-side comparison", value=False)
-    secondary  = None
-    if compare_on:
-        secondary = st.selectbox(
-            "Select second station",
-            [s for s in station_names if s != primary],
-            index=0,
+def insight_card(text: str, variant: str = "default"):
+    cls = {"warning": "warning-card", "critical": "critical-card"}.get(variant, "")
+    st.markdown(
+        f"<div class='insight-card {cls}'>{text}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def notice(msg: str):
+    st.markdown(
+        f"<div style='background:#0D1420;border:1px solid #1A2535;border-left:3px solid #1E2D40;"
+        f"border-radius:0 8px 8px 0;padding:10px 14px;font-size:0.8rem;color:#334155;"
+        f"margin:4px 0'>⚠ {msg}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def badge_html(band: str) -> str:
+    cls = f"badge-{band.lower()}" if band.lower() in ["critical","high","medium","low","monitor"] else "badge-monitor"
+    return f"<span class='badge {cls}'>{band}</span>"
+
+
+def rank_card_html(rank: int, name: str, score: float, max_score: float, color: str = ACCENT) -> str:
+    pct = max(4, int((score / max_score) * 100)) if max_score else 4
+    return (
+        f"<div class='rank-card'>"
+        f"<div class='rank-num'>#{rank:02d}</div>"
+        f"<div class='rank-bar-wrap'>"
+        f"<div class='rank-name'>{name}</div>"
+        f"<div class='rank-bar'><div class='rank-bar-fill' style='width:{pct}%'></div></div>"
+        f"</div>"
+        f"<div class='rank-score'>{score:.1f}</div>"
+        f"</div>"
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# SIDEBAR — Premium navigation
+# ─────────────────────────────────────────────────────────────
+
+NAV_ITEMS = [
+    ("🔷", "Executive Overview",       "System pulse & KPIs"),
+    ("🗺",  "Transit Intelligence Map", "Spatial connectivity layer"),
+    ("🔬", "Station Intelligence",      "Per-station diagnostics"),
+    ("⚙️", "Optimization & Coverage",  "MCLP facility placement"),
+    ("🧪", "Scenario Simulation",       "Intervention impact models"),
+    ("🚀", "Intervention Planning",    "Indicative deployment guidance"),
+]
+
+def render_sidebar():
+    with st.sidebar:
+        # Logo block
+        st.markdown("""
+        <div style='padding: 1.4rem 0.5rem 1rem'>
+            <div style='display:flex;align-items:center;gap:10px;margin-bottom:6px'>
+                <div style='width:32px;height:32px;border-radius:8px;
+                     background:linear-gradient(135deg,#00D4FF22,#6366F122);
+                     border:1px solid rgba(0,212,255,0.3);
+                     display:flex;align-items:center;justify-content:center;
+                     font-size:16px'>🚇</div>
+                <div>
+                    <div style='color:#FFFFFF;font-weight:800;font-size:1rem;
+                         letter-spacing:-0.02em;line-height:1'>METRO IQ</div>
+                    <div style='color:#334155;font-size:0.65rem;font-weight:600;
+                         text-transform:uppercase;letter-spacing:0.1em'>Hyderabad · v2.0</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("<div style='height:1px;background:linear-gradient(90deg,transparent,#1E2A3A,transparent);margin-bottom:12px'></div>", unsafe_allow_html=True)
+
+        # Navigation label
+        st.markdown("<div style='color:#1E3A5F;font-size:0.65rem;font-weight:700;text-transform:uppercase;letter-spacing:0.12em;padding:0 4px;margin-bottom:6px'>Navigation</div>", unsafe_allow_html=True)
+
+        page = st.radio(
+            "Navigation",
+            [item[1] for item in NAV_ITEMS],
+            label_visibility="collapsed",
         )
 
-    st.divider()
-    st.markdown("### ⚙️ LMCI Weights")
-    st.caption("Adjust weights to explore sensitivity (must sum to 1.0)")
-    w_d = st.slider("Density weight",   0.0, 1.0, CFG.w_density,   0.05)
-    w_f = st.slider("Frequency weight", 0.0, 1.0, CFG.w_frequency, 0.05)
-    w_w = st.slider("Walk-zone weight", 0.0, 1.0, CFG.w_walkzone,  0.05)
-    total_w = round(w_d + w_f + w_w, 4)
-    if abs(total_w - 1.0) > 0.001:
-        st.error(f"Weights sum to {total_w:.2f} — must equal 1.00")
-        weights_ok = False
+        st.markdown("<div style='height:1px;background:linear-gradient(90deg,transparent,#1E2A3A,transparent);margin:14px 0'></div>", unsafe_allow_html=True)
+
+        # System status
+        st.markdown("""
+        <div style='padding:10px 12px;background:#080C17;border:1px solid #1A2535;border-radius:10px'>
+            <div style='color:#1E3A5F;font-size:0.62rem;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px'>System Status</div>
+            <div style='display:flex;align-items:center;gap:8px;margin-bottom:5px'>
+                <div style='width:6px;height:6px;border-radius:50%;background:#00C48C;box-shadow:0 0 6px #00C48C'></div>
+                <span style='color:#475569;font-size:0.72rem'>Analytics Engine</span>
+                <span style='color:#00C48C;font-size:0.68rem;margin-left:auto'>LIVE</span>
+            </div>
+            <div style='display:flex;align-items:center;gap:8px;margin-bottom:5px'>
+                <div style='width:6px;height:6px;border-radius:50%;background:#00C48C;box-shadow:0 0 6px #00C48C'></div>
+                <span style='color:#475569;font-size:0.72rem'>LMCI Model</span>
+                <span style='color:#00C48C;font-size:0.68rem;margin-left:auto'>READY</span>
+            </div>
+            <div style='display:flex;align-items:center;gap:8px'>
+                <div style='width:6px;height:6px;border-radius:50%;background:#00C48C;box-shadow:0 0 6px #00C48C'></div>
+                <span style='color:#475569;font-size:0.72rem'>MCLP Solver</span>
+                <span style='color:#00C48C;font-size:0.68rem;margin-left:auto'>READY</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("""
+        <div style='margin-top:14px;color:#1E2D40;font-size:0.65rem;text-align:center;line-height:1.6'>
+            Urban Mobility Accessibility & Decision Support<br>
+            Hyderabad Metro · Last-Mile Platform
+        </div>
+        """, unsafe_allow_html=True)
+
+    return page
+
+
+# ─────────────────────────────────────────────────────────────
+# PAGE 1 — EXECUTIVE OVERVIEW
+# ─────────────────────────────────────────────────────────────
+
+def page_executive_overview(data: dict):
+    page_title(
+        "01 / System Overview",
+        "Executive Intelligence Briefing",
+        "Network-wide accessibility diagnostics · Hyderabad Metro HMRL · Multimodal connectivity intelligence",
+    )
+
+    exec_df  = data["exec_summary"]
+    priority = data["priority_scores"]
+    insights = data["insights_top5"]
+
+    # ── KPI ROW ──────────────────────────────────────────────
+    if exec_df is not None and not exec_df.empty:
+        with st.container(horizontal=True):
+            st.metric(
+                "Stations Analysed",
+                _fmt_num(_safe_val(exec_df, "total_stations_scored")),
+                "Full network", border=True,
+            )
+            n_crit = _safe_val(exec_df, "critical_priority_stations")
+            st.metric("Highest-Priority Stations", _fmt_num(n_crit), "Recommended for evaluation", border=True)
+            st.metric("Elevated-Priority Stations", _fmt_num(_safe_val(exec_df, "high_priority_stations")), "Near-term review window", border=True)
+            n_des = _safe_val(exec_df, "persistent_transit_deserts")
+            st.metric("Low-Access Zones", _fmt_num(n_des), "Candidate recovery areas", border=True)
+            cov = _safe_val(exec_df, "mclp_coverage_pct_at_k5", np.nan)
+            cov_str = f"{cov:.1f}%" if pd.notna(cov) else "N/A"
+            st.metric("Modelled Coverage @k=5", cov_str, "Scenario-based estimate", border=True)
     else:
-        st.success("Weights: ✓")
-        weights_ok = True
+        notice("executive_summary_metrics.csv not found. Run the full pipeline first.")
 
-    st.divider()
-    st.markdown("### 📊 Data Mode")
-    mode_label = "🔴 Synthetic fallback" if is_fallback else "✅ Live GTFS"
-    st.markdown(f"**{mode_label}**")
-    st.caption(f"Stations loaded: {len(lmci_df)}")
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+
+    # ── EXECUTIVE INSIGHT PANELS ─────────────────────────────
+    if priority is not None and not priority.empty:
+        n_crit_stations = int((priority.get("priority_band", pd.Series()) == "Critical").sum()) if "priority_band" in priority.columns else 0
+        n_total = len(priority)
+        n_deserts = int(priority.get("is_persistent_desert", pd.Series(False)).astype(str).str.lower().isin(["true","1","yes"]).sum()) if "is_persistent_desert" in priority.columns else 0
+
+        icols = st.columns(3, gap="small")
+        with icols[0]:
+            insight_card(
+                f"<strong>{n_crit_stations} stations</strong> score in the highest accessibility-risk band "
+                f"and are recommended for priority feasibility assessment.",
+                "critical",
+            )
+        with icols[1]:
+            insight_card(
+                f"<strong>{n_deserts} low-access zones</strong> identified — concentrated in "
+                f"expansion corridors with limited feeder connectivity. Requires ground-level validation.",
+                "warning",
+            )
+        with icols[2]:
+            insight_card(
+                "Integrated <strong>multimodal hubs</strong> show the highest relative accessibility uplift "
+                "per intervention unit across all modelled scenarios.",
+            )
+
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+    # ── CHARTS ROW ───────────────────────────────────────────
+    left, right = st.columns([1.65, 1], gap="medium")
+
+    with left:
+        with st.container(border=True):
+            section_header("Intervention Priority Distribution", "Station count by planning tier — composite accessibility scoring")
+            if priority is not None and "priority_band" in priority.columns:
+                band_counts = (
+                    priority["priority_band"]
+                    .value_counts()
+                    .reindex(["Critical", "High", "Medium", "Low", "Monitor"], fill_value=0)
+                    .reset_index()
+                )
+                band_counts.columns = ["Band", "Stations"]
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    x=band_counts["Band"],
+                    y=band_counts["Stations"],
+                    marker=dict(
+                        color=[COLOR_MAP_BAND.get(b, MUTED) for b in band_counts["Band"]],
+                        opacity=0.9,
+                        line=dict(width=0),
+                    ),
+                    text=band_counts["Stations"],
+                    textposition="outside",
+                    textfont=dict(size=13, color="#CBD5E1", family="Inter"),
+                    width=0.55,
+                ))
+                fig.update_layout(
+                    **{k: v for k, v in PLOTLY_THEME.items() if k not in ("xaxis", "yaxis")},
+                    showlegend=False,
+                    height=240,
+                    yaxis=dict(**PLOTLY_THEME["yaxis"], title=None),
+                    xaxis=dict(**PLOTLY_THEME["xaxis"], title=None),
+                )
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            else:
+                notice("Priority data unavailable.")
+
+    with right:
+        with st.container(border=True):
+            section_header("Demand–Service Mismatch", "Alignment classification across network")
+            if priority is not None and "mismatch_class" in priority.columns:
+                mc = priority["mismatch_class"].value_counts().reset_index()
+                mc.columns = ["Class", "Count"]
+                fig2 = go.Figure(go.Pie(
+                    labels=mc["Class"],
+                    values=mc["Count"],
+                    hole=0.62,
+                    marker=dict(
+                        colors=[CRITICAL, HIGH, MEDIUM, LOW, MUTED],
+                        line=dict(color="#0A0E1A", width=2),
+                    ),
+                    textinfo="percent",
+                    textfont=dict(size=10, color="#94A3B8"),
+                    hovertemplate="<b>%{label}</b><br>%{value} stations (%{percent})<extra></extra>",
+                ))
+                fig2.add_annotation(
+                    text=f"<b>{mc['Count'].sum()}</b><br><span style='font-size:9px'>STATIONS</span>",
+                    x=0.5, y=0.5, showarrow=False,
+                    font=dict(color="#F1F5F9", size=14, family="Inter"),
+                )
+                fig2.update_layout(**plotly_layout(
+                    showlegend=True, height=240,
+                    legend=axis_layout("legend", orientation="v", x=1.02),
+                ))
+                st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
+            else:
+                notice("Mismatch class data unavailable.")
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    # ── TOP PRIORITY STATIONS — Ranked cards ─────────────────
+    with st.container(border=True):
+        section_header("Top 10 Priority Stations", "Composite accessibility score · Indicative planning tier")
+        if priority is not None and "final_priority_score" in priority.columns:
+            top10 = priority.nlargest(10, "final_priority_score").reset_index(drop=True)
+            max_score = top10["final_priority_score"].max()
+            cards_html = ""
+            for i, row in top10.iterrows():
+                name  = str(row.get("stop_name", "—"))
+                score = float(row.get("final_priority_score", 0))
+                band  = str(row.get("priority_band", "Monitor"))
+                intv  = str(row.get("recommended_intervention", ""))
+                pct   = max(4, int((score / max_score) * 100)) if max_score else 4
+                bar_color = COLOR_MAP_BAND.get(band, MUTED)
+                cards_html += (
+                    f"<div class='rank-card'>"
+                    f"<div class='rank-num'>#{i+1:02d}</div>"
+                    f"<div class='rank-bar-wrap' style='flex:1'>"
+                    f"<div style='display:flex;justify-content:space-between;align-items:baseline'>"
+                    f"<span class='rank-name'>{name}</span>"
+                    f"{badge_html(band)}"
+                    f"</div>"
+                    f"<div style='color:#334155;font-size:0.72rem;margin-top:2px'>{intv}</div>"
+                    f"<div class='rank-bar'><div class='rank-bar-fill' style='width:{pct}%;background:{bar_color}'></div></div>"
+                    f"</div>"
+                    f"<div class='rank-score'>{score:.1f}</div>"
+                    f"</div>"
+                )
+            st.markdown(cards_html, unsafe_allow_html=True)
+        else:
+            notice("station_priority_scores.csv not found.")
+
+    # ── CONVERSION OPPORTUNITIES — compact ───────────────────
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    with st.container(border=True):
+        section_header("Top Intervention Candidates", "Highest accessibility uplift potential — indicative prioritisation")
+        if insights is not None and not insights.empty:
+            cols_show = [c for c in [
+                "stop_name", "final_priority_score", "recommended_intervention",
+                "deploy_action", "priority_band",
+            ] if c in insights.columns]
+            if cols_show:
+                disp = insights[cols_show].copy()
+                disp.rename(columns={
+                    "stop_name": "Station", "final_priority_score": "Priority Score",
+                    "recommended_intervention": "Indicative Action",
+                    "deploy_action": "Planning Status", "priority_band": "Band",
+                }, inplace=True)
+                if "Score" in disp.columns:
+                    disp["Score"] = disp["Score"].map(lambda x: f"{float(x):.1f}" if pd.notna(x) else "—")
+                st.dataframe(disp, hide_index=True, use_container_width=True)
+            else:
+                st.dataframe(insights, hide_index=True, use_container_width=True)
+        else:
+            notice("conversion_insights_top5.csv not found.")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. RECALCULATE LMCI on custom weights if changed
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# PAGE 2 — TRANSIT INTELLIGENCE MAP
+# ─────────────────────────────────────────────────────────────
 
-def recalc_lmci(df: pd.DataFrame, wd: float, wf: float, ww: float) -> pd.DataFrame:
-    """Recompute LMCI / LMCI_after from raw normalised components with new weights."""
-    df = df.copy()
-    if all(c in df.columns for c in ["norm_density", "norm_frequency", "norm_walkzone"]):
-        df["LMCI"] = 10.0 * (wd * df["norm_density"] + wf * df["norm_frequency"] + ww * df["norm_walkzone"])
-    if all(c in df.columns for c in ["norm_density_after", "norm_frequency_after", "norm_walkzone_after"]):
-        df["LMCI_after"] = 10.0 * (
-            wd * df["norm_density_after"] + wf * df["norm_frequency_after"] + ww * df["norm_walkzone_after"]
-        )
-    if "LMCI" in df.columns and "LMCI_after" in df.columns:
-        df["LMCI_improvement"] = df["LMCI_after"] - df["LMCI"]
-
-    def _cat(v):
-        if v >= 7:  return "Well-Connected"
-        if v >= 4:  return "Moderate"
-        return "Transit Desert"
-    if "LMCI" in df.columns:
-        df["category"] = df["LMCI"].apply(_cat)
-    return df
-
-
-display_df = recalc_lmci(lmci_df, w_d, w_f, w_w) if weights_ok else lmci_df
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. MAIN CONTENT
-# ─────────────────────────────────────────────────────────────────────────────
-
-row_a = display_df[display_df["stop_name"] == primary].iloc[0]
-row_b = display_df[display_df["stop_name"] == secondary].iloc[0] if secondary else None
-
-# ── 7a. Station detail cards ──────────────────────────────────────────────────
-
-def render_station_panel(row: pd.Series, col):
-    lmci_b  = row["LMCI"]
-    lmci_a  = row.get("LMCI_after", lmci_b)
-    delta   = row.get("LMCI_improvement", 0.0)
-    cat     = row.get("category", "Moderate")
-    cat_col = CAT_COLOURS.get(cat, "#888")
-
-    delta_cls   = "delta-positive" if delta > 0.01 else ("delta-negative" if delta < -0.01 else "delta-zero")
-    delta_arrow = "▲" if delta > 0.01 else ("▼" if delta < -0.01 else "●")
-
-    with col:
-        st.markdown(f"### {row['stop_name']}")
-        st.markdown(category_badge(cat), unsafe_allow_html=True)
-        st.markdown("")
-
-        c1, c2, c3 = st.columns(3)
-        c1.markdown(
-            f'<div class="metric-card" style="border-color:{cat_col}">'
-            f'<div class="label">LMCI Before</div>'
-            f'<div class="value" style="color:{cat_col}">{lmci_b:.2f}</div></div>',
-            unsafe_allow_html=True,
-        )
-        c2.markdown(
-            f'<div class="metric-card" style="border-color:#2ecc71">'
-            f'<div class="label">LMCI After</div>'
-            f'<div class="value" style="color:#2ecc71">{lmci_a:.2f}</div></div>',
-            unsafe_allow_html=True,
-        )
-        c3.markdown(
-            f'<div class="metric-card" style="border-color:#3498db">'
-            f'<div class="label">Delta (Δ)</div>'
-            f'<div class="value {delta_cls}">{delta_arrow} {delta:+.2f}</div></div>',
-            unsafe_allow_html=True,
-        )
-
-        g1, g2 = st.columns(2)
-        g1.plotly_chart(lmci_gauge(lmci_b, "Before MCLP", cat_col),   use_container_width=True)
-        g2.plotly_chart(lmci_gauge(lmci_a, "After MCLP",  "#2ecc71"), use_container_width=True)
-
-        # Raw metrics table
-        raw_cols = {
-            "Bus stops (3 km)": "stop_count_3km",
-            "Avg peak freq":    "avg_peak_freq",
-            "Walk-zone stops":  "stop_count_800m",
-            "Avg dist (m)":     "avg_dist_m",
-        }
-        meta = {k: row.get(v, "—") for k, v in raw_cols.items()}
-        st.markdown('<p class="section-header">Raw metrics</p>', unsafe_allow_html=True)
-        st.dataframe(
-            pd.DataFrame(meta, index=["Value"]).T.rename(columns={"Value": ""}),
-            use_container_width=True,
-            hide_index=False,
-        )
-
-
-if compare_on and row_b is not None:
-    col_a, col_sep, col_b = st.columns([5, 0.15, 5])
-    col_sep.markdown("<div style='border-left:1px solid #dee2e6;height:100%;margin:0 auto'></div>",
-                     unsafe_allow_html=True)
-    render_station_panel(row_a, col_a)
-    render_station_panel(row_b, col_b)
-else:
-    render_station_panel(row_a, st.container())
-
-st.divider()
-
-# ── 7b. Before / After bar chart ─────────────────────────────────────────────
-
-st.markdown('<p class="section-header">Before vs After LMCI — Bar Chart</p>', unsafe_allow_html=True)
-st.plotly_chart(
-    before_after_bar(row_a, row_b),
-    use_container_width=True,
-)
-
-st.divider()
-
-# ── 7c. All-stations overview ─────────────────────────────────────────────────
-
-st.markdown('<p class="section-header">All 27 Stations — LMCI Ranking (Before → After)</p>',
-            unsafe_allow_html=True)
-st.caption(
-    "Faded bar = Before · Solid bar = After · Blue highlight = selected station(s). "
-    "Red dotted line = Transit Desert threshold (4) · Green dotted = Well-Connected (7)."
-)
-highlight = [primary] + ([secondary] if secondary else [])
-st.plotly_chart(all_stations_chart(display_df, highlight), use_container_width=True)
-
-st.divider()
-
-# ── 7d. Full data table ───────────────────────────────────────────────────────
-with st.expander("📋 Full LMCI data table"):
-    show_cols = ["stop_name", "category", "LMCI", "LMCI_after", "LMCI_improvement",
-                 "stop_count_3km", "avg_peak_freq", "stop_count_800m"]
-    show_cols = [c for c in show_cols if c in display_df.columns]
-    fmt = {c: "{:.2f}" for c in ["LMCI", "LMCI_after", "LMCI_improvement", "avg_peak_freq"]}
-    st.dataframe(
-        display_df[show_cols].sort_values("LMCI", ascending=False).reset_index(drop=True),
-        use_container_width=True,
-        hide_index=True,
+def page_transit_map(data: dict):
+    page_title(
+        "02 / Spatial Intelligence",
+        "Transit Intelligence Map",
+        "Spatial accessibility layer · Planning priority zones · Low-access area overlays · Demand signal mapping",
     )
 
-# ── Footer ────────────────────────────────────────────────────────────────────
-st.markdown(
-    "<div style='text-align:center;color:#adb5bd;font-size:0.78rem;margin-top:30px'>"
-    "Hyderabad Metro Red Line · Last-Mile Connectivity Index · "
-    "Equity-Weighted MCLP Optimisation</div>",
-    unsafe_allow_html=True,
-)
+    priority = data["priority_scores"]
+
+    if priority is None or priority.empty:
+        notice("station_priority_scores.csv not found. Run the pipeline first.")
+        return
+
+    for col in ["stop_lat", "stop_lon"]:
+        if col in priority.columns:
+            priority[col] = pd.to_numeric(priority[col], errors="coerce")
+    map_df = priority.dropna(subset=["stop_lat", "stop_lon"]).copy()
+
+    if map_df.empty:
+        notice("No valid station coordinates found.")
+        return
+
+    # ── MAP LAYER CONTROLS ────────────────────────────────────
+    with st.sidebar:
+        st.markdown(
+            "<div style='height:1px;background:linear-gradient(90deg,transparent,#1E2A3A,transparent);margin:10px 0 12px'></div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<div style='color:#1E3A5F;font-size:0.65rem;font-weight:700;text-transform:uppercase;letter-spacing:0.12em;margin-bottom:8px'>Map Layers</div>",
+            unsafe_allow_html=True,
+        )
+        show_all      = st.checkbox("All Stations",      value=True)
+        show_critical = st.checkbox("Critical Priority", value=True)
+        show_mclp     = st.checkbox("MCLP Optimised",   value=True)
+        show_deserts  = st.checkbox("Transit Deserts",   value=True)
+        show_heatmap  = st.checkbox("Priority Heatmap",  value=False)
+
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        map_style = st.selectbox(
+            "Map Style",
+            ["carto-darkmatter", "dark", "satellite-streets"],
+            index=0,
+            label_visibility="collapsed",
+        )
+
+    # Build derived columns
+    def _color(row):
+        if "priority_band" in row.index:
+            return COLOR_MAP_BAND.get(row["priority_band"], MUTED)
+        return MUTED
+
+    map_df["_color"] = map_df.apply(_color, axis=1)
+    map_df["_size"]  = map_df.get("final_priority_score", pd.Series(50, index=map_df.index)).fillna(50)
+
+    # Rich hover template
+    def _hover(row):
+        band  = row.get("priority_band", "—")
+        score = row.get("final_priority_score", "—")
+        mism  = row.get("mismatch_class", "—")
+        desert = "Yes" if str(row.get("is_persistent_desert","")).lower() in ["true","1","yes"] else "No"
+        intv  = row.get("recommended_intervention", "—")
+        score_str = f"{float(score):.1f}" if score != "—" and pd.notna(score) else "—"
+        return (
+            f"<b style='color:#F1F5F9'>{row.get('stop_name','')}</b><br>"
+            f"<span style='color:#64748B'>Priority Band: </span>{band}<br>"
+            f"<span style='color:#64748B'>Score: </span>{score_str}<br>"
+            f"<span style='color:#64748B'>Mismatch: </span>{mism}<br>"
+            f"<span style='color:#64748B'>Transit Desert: </span>{desert}<br>"
+            f"<span style='color:#64748B'>Action: </span>{intv}"
+        )
+
+    map_df["_hover"] = map_df.apply(_hover, axis=1)
+
+    fig = go.Figure()
+
+    # ── Layer: All stations — sized by priority ───────────────
+    if show_all:
+        fig.add_trace(go.Scattermapbox(
+            lat=map_df["stop_lat"],
+            lon=map_df["stop_lon"],
+            mode="markers",
+            marker=dict(
+                size=map_df["_size"].clip(8, 20) / 2.2,
+                color=map_df["_color"],
+                opacity=0.75,
+            ),
+            hovertext=map_df["_hover"],
+            hoverinfo="text",
+            name="All Stations",
+            showlegend=True,
+        ))
+
+    # ── Layer: Priority heatmap ───────────────────────────────
+    if show_heatmap and "final_priority_score" in map_df.columns:
+        fig.add_trace(go.Densitymapbox(
+            lat=map_df["stop_lat"],
+            lon=map_df["stop_lon"],
+            z=map_df["final_priority_score"].fillna(0),
+            radius=40,
+            colorscale=[[0, "rgba(0,0,0,0)"], [0.4, "rgba(255,75,75,0.1)"], [1, "rgba(255,75,75,0.5)"]],
+            showscale=False,
+            name="Priority Heatmap",
+        ))
+
+    # ── Layer: Critical — glowing rings ──────────────────────
+    if show_critical and "priority_band" in map_df.columns:
+        crit = map_df[map_df["priority_band"] == "Critical"]
+        if not crit.empty:
+            # Outer glow ring
+            fig.add_trace(go.Scattermapbox(
+                lat=crit["stop_lat"], lon=crit["stop_lon"],
+                mode="markers",
+                marker=dict(size=22, color=CRITICAL, opacity=0.15),
+                hoverinfo="skip",
+                name="",
+                showlegend=False,
+            ))
+            # Inner marker
+            fig.add_trace(go.Scattermapbox(
+                lat=crit["stop_lat"], lon=crit["stop_lon"],
+                mode="markers+text",
+                text=crit.get("stop_name", pd.Series()),
+                textposition="top right",
+                textfont=dict(size=9, color=CRITICAL, family="Inter"),
+                marker=dict(size=13, color=CRITICAL, opacity=1.0),
+                hovertext=crit["_hover"],
+                hoverinfo="text",
+                name="Critical Priority",
+                showlegend=True,
+            ))
+
+    # ── Layer: MCLP — star markers ────────────────────────────
+    if show_mclp and "mclp_selected" in map_df.columns:
+        mclp = map_df[map_df["mclp_selected"].astype(str).str.lower().isin(["true","1","yes"])]
+        if not mclp.empty:
+            fig.add_trace(go.Scattermapbox(
+                lat=mclp["stop_lat"], lon=mclp["stop_lon"],
+                mode="markers",
+                marker=dict(size=14, color=ACCENT, opacity=0.95, symbol="star"),
+                hovertext=mclp["_hover"],
+                hoverinfo="text",
+                name="MCLP Optimised",
+                showlegend=True,
+            ))
+
+    # ── Layer: Transit deserts ─────────────────────────────────
+    if show_deserts and "is_persistent_desert" in map_df.columns:
+        deserts = map_df[map_df["is_persistent_desert"].astype(str).str.lower().isin(["true","1","yes"])]
+        if not deserts.empty:
+            # Desert zone glow
+            fig.add_trace(go.Scattermapbox(
+                lat=deserts["stop_lat"], lon=deserts["stop_lon"],
+                mode="markers",
+                marker=dict(size=24, color="#FF006E", opacity=0.08),
+                hoverinfo="skip",
+                showlegend=False,
+            ))
+            fig.add_trace(go.Scattermapbox(
+                lat=deserts["stop_lat"], lon=deserts["stop_lon"],
+                mode="markers",
+                marker=dict(size=11, color="#FF006E", opacity=0.85, symbol="square"),
+                hovertext=deserts["_hover"],
+                hoverinfo="text",
+                name="Transit Deserts",
+                showlegend=True,
+            ))
+
+    fig.update_layout(
+        mapbox=dict(
+            style=map_style,
+            center=dict(lat=17.385, lon=78.486),
+            zoom=10.5,
+        ),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=0, t=0, b=0),
+        legend=dict(
+            bgcolor="rgba(8,12,23,0.88)",
+            bordercolor="#1E2A3A",
+            borderwidth=1,
+            font=dict(color="#94A3B8", size=11, family="Inter"),
+            x=0.01, y=0.98,
+            xanchor="left",
+        ),
+        height=640,
+    )
+
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True, "scrollZoom": True})
+
+    # ── MAP STAT STRIP ────────────────────────────────────────
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    mcols = st.columns(4, gap="small")
+
+    n_crit = int((map_df.get("priority_band", pd.Series()) == "Critical").sum()) if "priority_band" in map_df.columns else "—"
+    n_mclp = int(map_df.get("mclp_selected", pd.Series(False)).astype(str).str.lower().isin(["true","1","yes"]).sum())
+    n_des  = int(map_df.get("is_persistent_desert", pd.Series(False)).astype(str).str.lower().isin(["true","1","yes"]).sum()) if "is_persistent_desert" in map_df.columns else "—"
+
+    with mcols[0]: st.metric("Stations Mapped",    len(map_df), border=True)
+    with mcols[1]: st.metric("Highest-Risk Nodes", n_crit, "Evaluation recommended", border=True)
+    with mcols[2]: st.metric("MCLP Candidates",    n_mclp, "Modelled placement sites", border=True)
+    with mcols[3]: st.metric("Low-Access Zones",   n_des,  "Candidate recovery areas", border=True)
+
+    # ── SPATIAL INSIGHTS ──────────────────────────────────────
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    left, right = st.columns(2, gap="medium")
+
+    with left:
+        with st.container(border=True):
+            section_header("Planning Tier Distribution", "Station count by accessibility priority band")
+            if "priority_band" in map_df.columns:
+                band_counts = map_df["priority_band"].value_counts().reset_index()
+                band_counts.columns = ["Band", "Count"]
+                fig3 = go.Figure(go.Bar(
+                    x=band_counts["Count"],
+                    y=band_counts["Band"],
+                    orientation="h",
+                    marker=dict(
+                        color=[COLOR_MAP_BAND.get(b, MUTED) for b in band_counts["Band"]],
+                        opacity=0.85,
+                        line=dict(width=0),
+                    ),
+                    text=band_counts["Count"],
+                    textposition="outside",
+                    textfont=dict(size=11, color="#94A3B8"),
+                ))
+                fig3.update_layout(**PLOTLY_THEME, height=200, showlegend=False)
+                st.plotly_chart(fig3, use_container_width=True, config={"displayModeBar": False})
+
+    with right:
+        with st.container(border=True):
+            section_header("Planning Observations", "Indicative spatial intelligence findings")
+            insight_card(
+                f"<strong>{n_crit} stations</strong> fall in the highest accessibility-risk band — "
+                "clustered in high-demand corridors. Recommended for feasibility assessment.",
+                "critical",
+            )
+            insight_card(
+                f"<strong>{n_des} low-access zones</strong> show the weakest multimodal connectivity scores. "
+                "Western expansion corridors appear most affected — pending ground validation.",
+                "warning",
+            )
+            insight_card(
+                f"<strong>{n_mclp} MCLP-modelled</strong> facility locations are estimated to maximise "
+                "demand coverage within an 800m walk radius under current assumptions.",
+            )
+
+
+# ─────────────────────────────────────────────────────────────
+# PAGE 3 — STATION INTELLIGENCE
+# ─────────────────────────────────────────────────────────────
+
+def page_station_intelligence(data: dict):
+    page_title(
+        "03 / Station Diagnostics",
+        "Station Intelligence",
+        "Per-station last-mile connectivity profile · LMCI decomposition · Demand-service alignment",
+    )
+
+    priority = data["priority_scores"]
+    mismatch = data["mismatch"]
+
+    if priority is None or priority.empty:
+        notice("station_priority_scores.csv not found.")
+        return
+
+    station_names = sorted(priority["stop_name"].dropna().unique().tolist())
+
+    col_sel, col_info = st.columns([2, 3], gap="medium")
+    with col_sel:
+        selected = st.selectbox(
+            "Select Station",
+            station_names,
+            help="Choose a metro station to explore its connectivity profile",
+            label_visibility="collapsed",
+        )
+
+    row = priority[priority["stop_name"] == selected].iloc[0]
+
+    band     = str(row.get("priority_band", "Monitor"))
+    score    = row.get("final_priority_score", None)
+    rank     = row.get("final_priority_rank", None)
+    intv     = str(row.get("recommended_intervention", "—"))
+    mism     = str(row.get("mismatch_class", "—"))
+    is_des   = str(row.get("is_persistent_desert", "")).lower() in ["true","1","yes"]
+    mclp_sel = str(row.get("mclp_selected", "")).lower() in ["true","1","yes"]
+
+    # ── STATION IDENTITY BANNER ───────────────────────────────
+    bar_color = COLOR_MAP_BAND.get(band, MUTED)
+    mclp_badge = "<span class='badge badge-low'>MCLP ✓</span>" if mclp_sel else ""
+    desert_badge = "<span class='badge badge-critical'>DESERT ⚠</span>" if is_des else ""
+
+    st.markdown(
+        f"<div style='background:linear-gradient(135deg,#0D1420,#111827);border:1px solid #1A2535;"
+        f"border-left:4px solid {bar_color};border-radius:0 12px 12px 0;padding:14px 20px;"
+        f"margin-bottom:16px;display:flex;align-items:center;gap:16px'>"
+        f"<div style='flex:1'>"
+        f"<div style='color:#F1F5F9;font-size:1.2rem;font-weight:800;letter-spacing:-0.02em'>{selected}</div>"
+        f"<div style='color:#475569;font-size:0.78rem;margin-top:3px'>{intv}</div>"
+        f"</div>"
+        f"<div style='display:flex;gap:10px;align-items:center'>"
+        f"{badge_html(band)}"
+        f"{mclp_badge}"
+        f"{desert_badge}"
+        f"</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── KPI STRIP ─────────────────────────────────────────────
+    kpi_cols = st.columns(5, gap="small")
+
+    def _metric_card(col, label, value, fmt="{}", delta=None):
+        try:
+            display = fmt.format(float(value)) if value not in [None, "—"] and pd.notna(value) else "—"
+        except Exception:
+            display = str(value)
+        with col:
+            st.metric(label, display, delta=delta, border=True)
+
+    _metric_card(kpi_cols[0], "Priority Score", score,                       "{:.1f}")
+    _metric_card(kpi_cols[1], "Priority Rank",  rank,                        "#{:.0f}")
+    _metric_card(kpi_cols[2], "Demand Signal",  row.get("demand_signal","—"),"{:.3f}")
+    _metric_card(kpi_cols[3], "Temporal Gap",   row.get("temporal_gap","—"), "{:.3f}")
+    kpi_cols[4].metric("MCLP Status", "✅ Selected" if mclp_sel else "❌ Not Selected", border=True)
+
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
+    # ── LMCI + RADAR ──────────────────────────────────────────
+    left, right = st.columns(2, gap="medium")
+
+    with left:
+        with st.container(border=True):
+            section_header("LMCI Breakdown", "Last-Mile Connectivity Index by time window")
+            lmci_cols = [c for c in ["Morning_LMCI","Midday_LMCI","Evening_LMCI"] if c in row.index]
+            if lmci_cols:
+                lmci_vals = [float(row.get(c, 0)) for c in lmci_cols]
+                labels    = [c.replace("_LMCI","") for c in lmci_cols]
+                colors    = [ACCENT, PURPLE, HIGH]
+                fig = go.Figure()
+                for i, (lbl, val, col_) in enumerate(zip(labels, lmci_vals, colors)):
+                    fig.add_trace(go.Bar(
+                        x=[lbl], y=[val],
+                        marker=dict(color=col_, opacity=0.85, line=dict(width=0)),
+                        text=[f"{val:.3f}"], textposition="outside",
+                        textfont=dict(size=12, color="#CBD5E1"),
+                        width=0.5, showlegend=False, name=lbl,
+                    ))
+                avg_lmci = np.mean(lmci_vals)
+                fig.add_hline(
+                    y=avg_lmci, line_dash="dot", line_color="#334155",
+                    annotation_text=f"avg {avg_lmci:.3f}",
+                    annotation_font_color="#475569", annotation_font_size=9,
+                )
+                fig.update_layout(
+                    **{k: v for k, v in PLOTLY_THEME.items() if k != "yaxis"},
+                    height=230,
+                    showlegend=False,
+                    barmode="group",
+                    yaxis=dict(
+                        **PLOTLY_THEME["yaxis"],
+                        range=[0, max(lmci_vals or [1]) * 1.3 + 0.05]
+                    ),
+                )
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            else:
+                notice("LMCI time-window columns not found.")
+
+    with right:
+        with st.container(border=True):
+            section_header("Connectivity Radar", "Normalised station attribute profile")
+            radar_cols = {
+                "demand_signal":                    "Demand Signal",
+                "temporal_gap":                     "Temporal Gap",
+                "equity_weighted_candidate_score":  "Equity Score",
+            }
+            available = {k: v for k, v in radar_cols.items() if k in row.index}
+            if available:
+                vals = [float(row.get(k, 0)) for k in available]
+                lbls = list(available.values())
+                vals_norm = [min(v, 1.0) if v <= 1.0 else v / 100.0 for v in vals]
+                fig2 = go.Figure(go.Scatterpolar(
+                    r=vals_norm + [vals_norm[0]],
+                    theta=lbls + [lbls[0]],
+                    fill="toself",
+                    fillcolor="rgba(0,212,255,0.08)",
+                    line=dict(color=ACCENT, width=2),
+                    marker=dict(color=ACCENT, size=6),
+                ))
+                fig2.update_layout(
+                    **{k: v for k, v in PLOTLY_THEME.items() if k not in ("xaxis","yaxis")},
+                    polar=dict(
+                        bgcolor="rgba(0,0,0,0)",
+                        radialaxis=dict(visible=True, color="#1E2D40", gridcolor="#1A2535",
+                                        range=[0, 1], tickfont=dict(size=8, color="#334155")),
+                        angularaxis=dict(color="#334155", tickfont=dict(size=10, color="#64748B")),
+                    ),
+                    height=230, showlegend=False,
+                )
+                st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
+            else:
+                notice("Insufficient signal columns for radar chart.")
+
+    # ── STATION PROFILE — expandable ──────────────────────────
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    with st.container(border=True):
+        section_header("Full Station Profile", "Complete attribute intelligence record")
+        display_cols = [c for c in [
+            "stop_id", "stop_name", "stop_lat", "stop_lon",
+            "mismatch_class", "desert_severity",
+            "is_persistent_desert", "is_high_demand_low_service",
+            "mclp_selection_rank", "recommended_intervention",
+        ] if c in row.index]
+
+        # Two-column attribute layout
+        half = len(display_cols) // 2
+        attr_l, attr_r = display_cols[:half], display_cols[half:]
+        cl, cr = st.columns(2, gap="medium")
+        for col_, attrs in [(cl, attr_l), (cr, attr_r)]:
+            with col_:
+                for a in attrs:
+                    val = row.get(a, "—")
+                    disp_val = str(val) if pd.notna(val) else "—"
+                    st.markdown(
+                        f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                        f"padding:7px 0;border-bottom:1px solid #0F1828'>"
+                        f"<span style='color:#334155;font-size:0.72rem;font-weight:600;text-transform:uppercase;"
+                        f"letter-spacing:0.06em'>{a.replace('_',' ').title()}</span>"
+                        f"<span style='color:#CBD5E1;font-size:0.82rem;font-family:JetBrains Mono,monospace'>{disp_val}</span>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+
+# ─────────────────────────────────────────────────────────────
+# PAGE 4 — OPTIMIZATION & COVERAGE
+# ─────────────────────────────────────────────────────────────
+
+def page_optimization(data: dict):
+    page_title(
+        "04 / Optimization Engine",
+        "Optimization & Coverage Analysis",
+        "MCLP facility placement · Coverage curves · Marginal demand attribution · Equity-weighted scoring",
+    )
+
+    coverage  = data["mclp_coverage"]
+    selected  = data["mclp_selected"]
+    candidates = data["mclp_candidates"]
+
+    # ── EXECUTIVE INSIGHT ─────────────────────────────────────
+    if coverage is not None and "coverage_pct" in coverage.columns:
+        k5_cov = coverage[coverage.get("k", coverage.iloc[:,0]) == 5]["coverage_pct"].values
+        cov_msg = f"<strong>{k5_cov[0]:.1f}%</strong> demand coverage achieved at k=5 facilities." if len(k5_cov) else ""
+        if cov_msg:
+            insight_card(
+                f"{cov_msg} Each additional facility beyond k=5 yields diminishing marginal returns — "
+                "representing the optimal deployment threshold.",
+            )
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    tab1, tab2, tab3 = st.tabs(["📈  Coverage Curve", "🏆  Selected Stations", "📋  Candidate Rankings"])
+
+    with tab1:
+        with st.container(border=True):
+            section_header("MCLP Coverage Curve", "Cumulative demand coverage (%) as a function of facility count k")
+            if coverage is not None and not coverage.empty and "coverage_pct" in coverage.columns:
+                k_col = "k" if "k" in coverage.columns else coverage.columns[0]
+                coverage_plot = coverage.copy()
+
+                fig = go.Figure()
+                # Fill area
+                fig.add_trace(go.Scatter(
+                    x=coverage_plot[k_col], y=coverage_plot["coverage_pct"],
+                    mode="none", fill="tozeroy",
+                    fillcolor="rgba(0,212,255,0.05)",
+                    showlegend=False,
+                ))
+                # Line
+                fig.add_trace(go.Scatter(
+                    x=coverage_plot[k_col], y=coverage_plot["coverage_pct"],
+                    mode="lines+markers",
+                    line=dict(color=ACCENT, width=2.5),
+                    marker=dict(size=8, color=ACCENT,
+                                line=dict(color="#0A0E1A", width=2)),
+                    name="Coverage %",
+                    hovertemplate="k=%{x}<br>Coverage: %{y:.1f}%<extra></extra>",
+                ))
+                fig.add_hline(y=80, line_dash="dash", line_color=LOW, line_width=1,
+                              annotation_text="80% target", annotation_font_color=LOW,
+                              annotation_font_size=9)
+                # Mark k=5
+                if 5 in coverage_plot[k_col].values:
+                    k5_val = coverage_plot[coverage_plot[k_col]==5]["coverage_pct"].iloc[0]
+                    fig.add_trace(go.Scatter(
+                        x=[5], y=[k5_val], mode="markers",
+                        marker=dict(size=14, color=ACCENT, symbol="diamond",
+                                    line=dict(color="#0A0E1A", width=2)),
+                        name=f"k=5 ({k5_val:.1f}%)",
+                        hovertemplate=f"Optimal k=5<br>Coverage: {k5_val:.1f}%<extra></extra>",
+                    ))
+                fig.update_layout(
+                    **{k: v for k, v in PLOTLY_THEME.items() if k not in ("xaxis", "yaxis")},
+                    height=340,
+                    xaxis=dict(**PLOTLY_THEME["xaxis"], title="Number of Facilities (k)", dtick=1),
+                    yaxis=dict(**PLOTLY_THEME["yaxis"], title="Coverage (%)", range=[0, 105]),
+                )
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+                # Marginal gain bar
+                if len(coverage_plot) > 1:
+                    coverage_plot = coverage_plot.copy()
+                    coverage_plot["marginal_gain"] = coverage_plot["coverage_pct"].diff().fillna(
+                        coverage_plot["coverage_pct"].iloc[0]
+                    )
+                    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+                    section_header("Marginal Coverage Gain", "Additional coverage per incremental facility")
+                    fig_mg = go.Figure(go.Bar(
+                        x=coverage_plot[k_col],
+                        y=coverage_plot["marginal_gain"],
+                        marker=dict(
+                            color=coverage_plot["marginal_gain"],
+                            colorscale=[[0,"#1E2D40"],[1,ACCENT]],
+                            line=dict(width=0),
+                        ),
+                        text=coverage_plot["marginal_gain"].map(lambda x: f"+{x:.1f}%"),
+                        textposition="outside",
+                        textfont=dict(size=10, color="#64748B"),
+                        width=0.6,
+                    ))
+                    fig_mg.update_layout(
+                        **{k: v for k, v in PLOTLY_THEME.items() if k not in ("xaxis", "yaxis")},
+                        height=200,
+                        showlegend=False,
+                        xaxis=dict(**PLOTLY_THEME["xaxis"], title="k"),
+                        yaxis=dict(**PLOTLY_THEME["yaxis"], title="Marginal Gain (%)"),
+                    )
+                    st.plotly_chart(fig_mg, use_container_width=True, config={"displayModeBar": False})
+            else:
+                notice("mclp_coverage_by_k.csv not found.")
+
+    with tab2:
+        with st.container(border=True):
+            section_header("MCLP Selected Stations", "Optimally placed facilities ranked by marginal demand coverage")
+            if selected is not None and not selected.empty:
+                if "marginal_weighted_demand" in selected.columns and "stop_name" in selected.columns:
+                    plot_df = selected.sort_values("marginal_weighted_demand", ascending=True).tail(15)
+                    fig3 = go.Figure(go.Bar(
+                        x=plot_df["marginal_weighted_demand"],
+                        y=plot_df["stop_name"],
+                        orientation="h",
+                        marker=dict(
+                            color=plot_df["marginal_weighted_demand"],
+                            colorscale=[[0,"#1A2535"],[0.5,PURPLE],[1,ACCENT]],
+                            line=dict(width=0),
+                        ),
+                        text=plot_df["marginal_weighted_demand"].map(lambda x: f"{x:.0f}"),
+                        textposition="outside",
+                        textfont=dict(size=10, color="#64748B"),
+                    ))
+                    fig3.update_layout(**plotly_layout(
+                        height=380, showlegend=False,
+                        xaxis=axis_layout("xaxis", title="Marginal Weighted Demand"),
+                        yaxis=axis_layout("yaxis", tickfont=dict(size=10, color="#94A3B8")),
+                    ))
+                    st.plotly_chart(fig3, use_container_width=True, config={"displayModeBar": False})
+
+                # Ranked cards
+                show_sel = selected.copy()
+                if "marginal_weighted_demand" in show_sel.columns:
+                    show_sel = show_sel.sort_values("marginal_weighted_demand", ascending=False).head(10)
+                max_val = show_sel["marginal_weighted_demand"].max() if "marginal_weighted_demand" in show_sel.columns else 1
+                cards_html = ""
+                for i, (_, srow) in enumerate(show_sel.iterrows()):
+                    name  = str(srow.get("stop_name", "—"))
+                    val   = float(srow.get("marginal_weighted_demand", 0))
+                    pct   = max(4, int((val / max_val) * 100)) if max_val else 4
+                    cards_html += rank_card_html(i+1, name, val, max_val)
+                st.markdown(cards_html, unsafe_allow_html=True)
+            else:
+                notice("mclp_selected_stations.csv not found.")
+
+    with tab3:
+        with st.container(border=True):
+            section_header("Candidate Station Rankings", "Top 20 stations ranked by MCLP potential")
+            if candidates is not None and not candidates.empty:
+                rank_col = "candidate_rank" if "candidate_rank" in candidates.columns else None
+                top_cands = candidates.nsmallest(20, rank_col) if rank_col else candidates.head(20)
+                show_cols = [c for c in [
+                    "stop_name", "candidate_rank", "covered_demand_points_if_selected",
+                    "weighted_demand_if_selected", "equity_weighted_candidate_score",
+                ] if c in top_cands.columns]
+                disp2 = top_cands[show_cols].rename(columns={
+                    "stop_name": "Station", "candidate_rank": "Rank",
+                    "covered_demand_points_if_selected": "Demand Points",
+                    "weighted_demand_if_selected": "Weighted Demand",
+                    "equity_weighted_candidate_score": "Equity Score",
+                })
+                if "Rank" in disp2.columns:
+                    disp2["Rank"] = disp2["Rank"].map(lambda x: f"#{int(x)}" if pd.notna(x) else "—")
+                st.dataframe(disp2, hide_index=True, use_container_width=True)
+            else:
+                notice("mclp_candidate_scores.csv not found.")
+
+
+# ─────────────────────────────────────────────────────────────
+# PAGE 5 — SCENARIO SIMULATION
+# ─────────────────────────────────────────────────────────────
+
+def page_simulation(data: dict):
+    page_title(
+        "05 / Scenario Modelling",
+        "Scenario Simulation Engine",
+        "Intervention impact modelling · Accessibility improvement potential · Connectivity uplift comparison",
+    )
+
+    impacts   = data["sim_impacts"]
+    ranking   = data["sim_ranking"]
+    network   = data["sim_network"]
+    scenarios = data["sim_scenarios"]
+
+    # ── NETWORK SUMMARY KPIS ──────────────────────────────────
+    if network is not None and not network.empty:
+        with st.container(horizontal=True):
+            st.metric("Accessibility Uplift Score",  _fmt_num(_safe_val(network,"estimated_daily_ridership_gain")),
+                      "Composite index · Not a count", border=True)
+            st.metric("Mean LMCI Enhancement",       f"{_safe_val(network,'mean_lmci_gain'):.3f}",
+                      "Modelled connectivity gain", border=True)
+            st.metric("Scenarios Evaluated",          _fmt_num(_safe_val(network,"top_interventions_evaluated")),
+                      "Intervention combinations", border=True)
+            st.metric("Low-Access Zones Targeted",    _fmt_num(_safe_val(network,"persistent_deserts_targeted")),
+                      "Candidate recovery areas", border=True)
+            st.metric("Multimodal Scenarios",         _fmt_num(_safe_val(network,"multimodal_projects_recommended")),
+                      "Hub integration candidates", border=True)
+
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+        # Network impact narrative
+        gain    = _safe_val(network,"estimated_daily_ridership_gain", 0)
+        lm_gain = _safe_val(network,"mean_lmci_gain", 0)
+        st.markdown(
+            f"<div class='network-impact'>"
+            f"<div class='network-impact-label'>Indicative Network Impact Assessment — Scenario-Based Modelling</div>"
+            f"<div class='network-impact-text'>Based on accessibility and multimodal connectivity modelling, "
+            f"the recommended interventions are estimated to yield a "
+            f"<strong style='color:{ACCENT}'>relative Accessibility Uplift Score of {_fmt_num(gain)}</strong> "
+            f"<em style='color:#475569;font-size:0.8em'>(composite index — not a ridership count)</em>, "
+            f"with a mean LMCI improvement of "
+            f"<strong style='color:{LOW}'>+{lm_gain:.3f} points</strong> across the network. "
+            f"Multimodal hub scenarios show higher relative connectivity enhancement "
+            f"compared to single-mode feeder scenarios across modelled conditions. "
+            f"<em style='color:#334155;font-size:0.78rem'>Indicative simulation only. Not a ridership forecast. Requires feasibility validation.</em>"
+            f"</div></div>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+
+    # ── FILTER ────────────────────────────────────────────────
+    if scenarios is not None and "intervention_type" in scenarios.columns:
+        types = ["All"] + sorted(scenarios["intervention_type"].dropna().unique().tolist())
+        sel_type = st.selectbox("Filter by Intervention Type", types, label_visibility="collapsed")
+        filtered = scenarios if sel_type == "All" else scenarios[scenarios["intervention_type"] == sel_type]
+    else:
+        filtered = scenarios
+        sel_type = "All"
+
+    tab1, tab2, tab3 = st.tabs(["🏆  Station Impact Rankings", "⚡  Intervention Comparison", "📋  Scenario Matrix"])
+
+    with tab1:
+        with st.container(border=True):
+            section_header("Top Station Interventions", "Ranked by modelled accessibility uplift potential — scenario-based estimates")
+            if impacts is not None and not impacts.empty:
+                top_imp = (
+                    impacts.nlargest(15, "simulation_priority_score")
+                    if "simulation_priority_score" in impacts.columns
+                    else impacts.head(15)
+                )
+
+                # Scenario cards
+                if "scenario_name" in top_imp.columns and "simulated_daily_ridership_gain" in top_imp.columns:
+                    max_rid = top_imp["simulated_daily_ridership_gain"].max()
+                    max_lmci = top_imp["lmci_gain"].max() if "lmci_gain" in top_imp.columns else 1
+                    for _, irow in top_imp.iterrows():
+                        name    = str(irow.get("stop_name","—"))
+                        sc_name = str(irow.get("scenario_name","—"))
+                        rid     = float(irow.get("simulated_daily_ridership_gain",0))
+                        lmci    = float(irow.get("lmci_gain",0)) if "lmci_gain" in irow.index else 0
+                        net_val = float(irow.get("network_value_score",0)) if "network_value_score" in irow.index else 0
+                        cost    = str(irow.get("cost_band","—"))
+                        rid_pct = max(4, int((rid / max_rid)*100)) if max_rid else 4
+                        cost_col = {"Low": LOW, "Medium": MEDIUM, "High": HIGH, "Very High": CRITICAL}.get(cost, MUTED)
+                        st.markdown(
+                            f"<div class='scenario-card'>"
+                            f"<div style='display:flex;justify-content:space-between;align-items:start'>"
+                            f"<div><div class='scenario-type'>{sc_name}</div>"
+                            f"<div class='scenario-name'>{name}</div></div>"
+                            f"<span class='badge' style='background:rgba(0,0,0,0.2);color:{cost_col};"
+                            f"border:1px solid {cost_col}44'>{cost} Cost</span>"
+                            f"</div>"
+                            f"<div class='scenario-metrics'>"
+                            f"<div><div class='scenario-metric-val' style='color:{ACCENT}'>{_fmt_num(rid)}</div>"
+                            f"<div class='scenario-metric-lbl'>Impact Index</div></div>"
+                            f"<div><div class='scenario-metric-val' style='color:{LOW}'>+{lmci:.3f}</div>"
+                            f"<div class='scenario-metric-lbl'>LMCI Uplift</div></div>"
+                            f"<div><div class='scenario-metric-val' style='color:{PURPLE}'>{net_val:.2f}</div>"
+                            f"<div class='scenario-metric-lbl'>Network Value</div></div>"
+                            f"</div>"
+                            f"<div class='rank-bar' style='margin-top:10px'>"
+                            f"<div class='rank-bar-fill' style='width:{rid_pct}%'></div></div>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                # Ridership chart
+                if "simulated_daily_ridership_gain" in impacts.columns:
+                    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+                    section_header("Accessibility Impact Index by Station", "Top 12 interventions · Relative connectivity benefit score")
+                    top15 = impacts.nlargest(12, "simulated_daily_ridership_gain")
+                    fig = go.Figure(go.Bar(
+                        x=top15["simulated_daily_ridership_gain"],
+                        y=top15["stop_name"],
+                        orientation="h",
+                        marker=dict(
+                            color=top15["simulated_daily_ridership_gain"],
+                            colorscale=[[0,"#1A2535"],[0.5,PURPLE],[1,ACCENT]],
+                            line=dict(width=0),
+                        ),
+                        text=top15["simulated_daily_ridership_gain"].map(lambda x: f"+{_fmt_num(x)}"),
+                        textposition="outside",
+                        textfont=dict(size=10, color="#64748B"),
+                    ))
+                    fig.update_layout(**plotly_layout(
+                        height=380, showlegend=False,
+                        xaxis=axis_layout("xaxis", title="Accessibility Impact Index (Relative)"),
+                        yaxis=axis_layout("yaxis", tickfont=dict(size=10, color="#94A3B8")),
+                    ))
+                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            else:
+                notice("simulation_station_impacts.csv not found.")
+
+    with tab2:
+        with st.container(border=True):
+            section_header("Intervention Type Comparison", "Relative modelled performance by intervention category — indicative planning reference")
+            if ranking is not None and not ranking.empty:
+                metric_opts = [c for c in [
+                    "simulation_priority_score","lmci_gain",
+                    "simulated_daily_ridership_gain","network_value_score",
+                ] if c in ranking.columns]
+                if metric_opts:
+                    chosen = st.selectbox(
+                        "Metric", metric_opts,
+                        format_func=lambda x: x.replace("_"," ").title(),
+                        label_visibility="collapsed",
+                    )
+                    rank_df = ranking.sort_values(chosen, ascending=False).copy()
+                    cost_col_map = {"Low": LOW, "Medium": MEDIUM, "High": HIGH, "Very High": CRITICAL}
+                    bar_colors = [
+                        cost_col_map.get(str(c), MUTED)
+                        for c in rank_df.get("cost_band", pd.Series())
+                    ] if "cost_band" in rank_df.columns else [ACCENT] * len(rank_df)
+
+                    name_col = "scenario_name" if "scenario_name" in rank_df.columns else rank_df.columns[0]
+                    fig2 = go.Figure(go.Bar(
+                        x=rank_df[name_col],
+                        y=rank_df[chosen],
+                        marker=dict(color=bar_colors, opacity=0.85, line=dict(width=0)),
+                        text=rank_df[chosen].map(lambda x: f"{x:.2f}"),
+                        textposition="outside",
+                        textfont=dict(size=11, color="#94A3B8"),
+                        width=0.55,
+                    ))
+                    fig2.update_layout(**plotly_layout(
+                        height=320,
+                        xaxis=axis_layout("xaxis", title="Scenario Type"),
+                        yaxis=axis_layout("yaxis", title=chosen.replace("_", " ").title()),
+                    ))
+                    st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
+
+                    # Strategic ranking callouts
+                    if not rank_df.empty:
+                        best = rank_df.iloc[0]
+                        best_name = str(best.get(name_col, "—"))
+                        best_val  = float(best.get(chosen, 0))
+                        insight_card(
+                            f"<strong>{best_name}</strong> shows the highest relative modelled performance "
+                            f"on <em>{chosen.replace('_',' ')}</em> ({best_val:.2f}). "
+                            "This category may warrant priority consideration in feasibility planning — subject to ground-level validation.",
+                        )
+                else:
+                    st.dataframe(ranking, hide_index=True, use_container_width=True)
+            else:
+                notice("simulation_intervention_ranking.csv not found.")
+
+    with tab3:
+        with st.container(border=True):
+            section_header("Full Scenario Matrix", "All station × intervention combinations · Indicative accessibility estimates")
+            if filtered is not None and not filtered.empty:
+                show_cols = [c for c in [
+                    "stop_name","scenario_name","intervention_type",
+                    "lmci_gain","simulated_daily_ridership_gain",
+                    "network_value_score","simulation_priority_score","cost_band",
+                ] if c in filtered.columns]
+                disp = filtered[show_cols].rename(columns={
+                    "stop_name":"Station","scenario_name":"Scenario",
+                    "intervention_type":"Type","lmci_gain":"LMCI Δ",
+                    "simulated_daily_ridership_gain":"Impact Index",
+                    "network_value_score":"Network Value",
+                    "simulation_priority_score":"Priority","cost_band":"Cost",
+                })
+                if "LMCI Δ" in disp.columns:
+                    disp["LMCI Δ"] = disp["LMCI Δ"].map(lambda x: f"+{float(x):.4f}" if pd.notna(x) else "—")
+                if "Impact Index" in disp.columns:
+                    disp["Impact Index"] = disp["Impact Index"].map(lambda x: f"{_fmt_num(x)}" if pd.notna(x) else "—")
+                st.dataframe(disp, hide_index=True, use_container_width=True)
+            else:
+                notice("Scenario data unavailable.")
+
+
+# ─────────────────────────────────────────────────────────────
+# PAGE 6 — RECOMMENDATIONS ENGINE
+# ─────────────────────────────────────────────────────────────
+
+def page_recommendations(data: dict):
+    page_title(
+        "06 / Planning Support",
+        "Intervention Planning Engine",
+        "Indicative action priorities · Scenario-based planning tiers · Accessibility investment guidance",
+    )
+
+    insights = data["insights_top5"]
+    priority = data["priority_scores"]
+    sim_net  = data["sim_network"]
+
+    # ── STRATEGIC KPIs ────────────────────────────────────────
+    if priority is not None:
+        n_critical = int((priority.get("priority_band","") == "Critical").sum()) if "priority_band" in priority.columns else 0
+        n_high     = int((priority.get("priority_band","") == "High").sum()) if "priority_band" in priority.columns else 0
+        n_deserts  = int(priority.get("is_persistent_desert", pd.Series(False)).astype(str).str.lower().isin(["true","1","yes"]).sum()) if "is_persistent_desert" in priority.columns else 0
+
+        with st.container(horizontal=True):
+            st.metric("Highest-Priority Stations", n_critical, "Recommended for assessment", border=True)
+            st.metric("Elevated-Priority Stations", n_high,    "Near-term review window", border=True)
+            st.metric("Low-Access Recovery Zones", n_deserts,  "Candidate intervention areas", border=True)
+            if sim_net is not None and not sim_net.empty:
+                gain     = _safe_val(sim_net,"estimated_daily_ridership_gain",0)
+                lmci_g   = _safe_val(sim_net,"mean_lmci_gain",0)
+                st.metric("Accessibility Uplift Score", _fmt_num(gain), "Composite index · Not a count", border=True)
+                st.metric("Mean LMCI Enhancement", f"+{lmci_g:.3f}", "Modelled connectivity gain", border=True)
+
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+
+    # ── EXECUTIVE INSIGHT PANELS ──────────────────────────────
+    icols = st.columns(3, gap="small")
+    with icols[0]:
+        n_c = n_critical if priority is not None else "?"
+        insight_card(
+            f"<strong>{n_c} stations</strong> score in the highest accessibility-risk band. "
+            "Feeder or multimodal interventions are indicated — feasibility assessment recommended.",
+            "critical",
+        )
+    with icols[1]:
+        insight_card(
+            "Integrated <strong>multimodal hubs</strong> show the highest relative accessibility uplift — "
+            "outperforming feeder-only scenarios on connectivity enhancement across modelled conditions.",
+            "warning",
+        )
+    with icols[2]:
+        insight_card(
+            "Low-access zones remain concentrated in western expansion corridors. "
+            "These areas are <strong>candidate sites</strong> for Phase 2 connectivity investment.",
+        )
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    # ── DEPLOY NOW ────────────────────────────────────────────
+    with st.container(border=True):
+        section_header("📋 Priority Assessment List", "Stations flagged for near-term feasibility review · Indicative planning priority")
+
+        deploy_df = None
+        if insights is not None and not insights.empty:
+            if "deploy_action" in insights.columns:
+                deploy_df = insights[insights["deploy_action"].str.upper() == "DEPLOY NOW"]
+            else:
+                deploy_df = insights
+        elif priority is not None and "priority_band" in priority.columns:
+            deploy_df = priority[priority["priority_band"] == "Critical"].nlargest(5,"final_priority_score")
+
+        if deploy_df is not None and not deploy_df.empty:
+            for _, row in deploy_df.iterrows():
+                name  = row.get("stop_name","Unknown")
+                score = row.get("final_priority_score","—")
+                intv  = row.get("recommended_intervention","Feasibility assessment indicated")
+                band  = str(row.get("priority_band","Critical"))
+                score_str = f"{float(score):.1f}" if score != "—" and pd.notna(score) else "—"
+                st.markdown(
+                    f"<div class='deploy-card'>"
+                    f"<div><div class='deploy-name'>{name}</div>"
+                    f"<div class='deploy-action'>{intv}</div></div>"
+                    f"<div style='display:flex;align-items:center;gap:10px'>"
+                    f"{badge_html(band)}"
+                    f"<div class='deploy-score'>Score {score_str}</div>"
+                    f"</div></div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            notice("No stations in the highest planning tier. Review priority thresholds.")
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+    # ── MONITOR + INTERVENTION DISTRIBUTION ──────────────────
+    left, right = st.columns(2, gap="medium")
+
+    with left:
+        with st.container(border=True):
+            section_header("Monitoring Watchlist", "Elevated-priority stations · Near-term planning review")
+            if priority is not None and "priority_band" in priority.columns:
+                monitor_df = priority[priority["priority_band"].isin(["High","Medium"])].nlargest(8,"final_priority_score")
+                max_s = monitor_df["final_priority_score"].max() if "final_priority_score" in monitor_df.columns else 1
+                for _, mrow in monitor_df.iterrows():
+                    name  = str(mrow.get("stop_name","—"))
+                    score = float(mrow.get("final_priority_score",0))
+                    band  = str(mrow.get("priority_band","Medium"))
+                    pct   = max(4, int((score/max_s)*100)) if max_s else 4
+                    st.markdown(
+                        f"<div style='display:flex;align-items:center;gap:12px;padding:8px 0;"
+                        f"border-bottom:1px solid #0F1828'>"
+                        f"<div style='flex:1'>"
+                        f"<div style='color:#CBD5E1;font-size:0.82rem;font-weight:600'>{name}</div>"
+                        f"<div class='rank-bar'><div class='rank-bar-fill' style='width:{pct}%;"
+                        f"background:{COLOR_MAP_BAND.get(band,MUTED)}'></div></div>"
+                        f"</div>"
+                        f"{badge_html(band)}"
+                        f"<span style='color:#334155;font-size:0.72rem;font-family:JetBrains Mono,monospace;min-width:32px'>{score:.1f}</span>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                notice("Priority data unavailable.")
+
+    with right:
+        with st.container(border=True):
+            section_header("Indicative Action Distribution", "Planning action categories by station count")
+            if priority is not None and "recommended_intervention" in priority.columns:
+                intv_counts = priority["recommended_intervention"].value_counts().head(8).reset_index()
+                intv_counts.columns = ["Intervention","Count"]
+                fig = go.Figure(go.Bar(
+                    x=intv_counts.sort_values("Count")["Count"],
+                    y=intv_counts.sort_values("Count")["Intervention"],
+                    orientation="h",
+                    marker=dict(
+                        color=intv_counts.sort_values("Count")["Count"],
+                        colorscale=[[0,"#1A2535"],[1,ACCENT]],
+                        line=dict(width=0),
+                    ),
+                    text=intv_counts.sort_values("Count")["Count"],
+                    textposition="outside",
+                    textfont=dict(size=11, color="#64748B"),
+                ))
+                fig.update_layout(**plotly_layout(
+                    height=280, showlegend=False,
+                    coloraxis_showscale=False,
+                    yaxis=axis_layout("yaxis", tickfont=dict(size=9, color="#94A3B8")),
+                ))
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            else:
+                notice("Intervention data unavailable.")
+
+    # ── NETWORK IMPACT NARRATIVE ──────────────────────────────
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    if sim_net is not None and not sim_net.empty:
+        gain    = _safe_val(sim_net,"estimated_daily_ridership_gain",0)
+        lmci_g  = _safe_val(sim_net,"mean_lmci_gain",0)
+        with st.container(border=True):
+            section_header("Network-Level Planning Summary", "Scenario-based assessment · Indicative investment sequencing")
+            st.markdown(
+                f"<div class='network-impact' style='margin-top:8px'>"
+                f"<div class='network-impact-label'>Indicative Network Assessment — Scenario-Based Modelling</div>"
+                f"<div class='network-impact-text'>"
+                f"Based on accessibility and multimodal connectivity modelling, the recommended intervention portfolio "
+                f"is estimated to yield a <strong style='color:{ACCENT}'>relative Accessibility Uplift Score of {_fmt_num(gain)}</strong> "
+                f"<em style='color:#475569;font-size:0.8em'>(composite index — not a ridership count)</em>, "
+                f"with a mean LMCI enhancement of "
+                f"<strong style='color:{LOW}'>+{lmci_g:.3f} points</strong> across the Hyderabad Metro network. "
+                f"Phase 1 planning should concentrate on highest-priority stations with multimodal upgrade potential. "
+                f"Phase 2 should address low-access zones through feeder route densification in expansion corridors. "
+                f"<em style='color:#334155;font-size:0.78rem'>Indicative simulation only. All outputs reflect accessibility and connectivity assumptions — not AFC, passenger count, or revenue data. Ground-level feasibility validation required before operational use.</em>"
+                f"</div></div>",
+                unsafe_allow_html=True,
+            )
+
+    # ── EXPORT ────────────────────────────────────────────────
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    if priority is not None:
+        st.download_button(
+            "⬇  Export Accessibility Priority Report (CSV)",
+            priority.to_csv(index=False).encode("utf-8"),
+            file_name="hyd_metro_accessibility_priority.csv",
+            mime="text/csv",
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+
+def main():
+    data = load_all()
+    page = render_sidebar()
+
+    if page == "Executive Overview":
+        page_executive_overview(data)
+    elif page == "Transit Intelligence Map":
+        page_transit_map(data)
+    elif page == "Station Intelligence":
+        page_station_intelligence(data)
+    elif page == "Optimization & Coverage":
+        page_optimization(data)
+    elif page == "Scenario Simulation":
+        page_simulation(data)
+    elif page == "Intervention Planning":
+        page_recommendations(data)
+
+
+if __name__ == "__main__":
+    main()
