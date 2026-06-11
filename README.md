@@ -1,268 +1,224 @@
-# 🚇 Hyderabad Metro Red Line — AI-Driven Last-Mile Connectivity Optimization
+# Hyderabad Metro Last-Mile Intelligence Platform
 
-![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
-![GeoSpatial](https://img.shields.io/badge/GeoSpatial-GeoPandas-green)
-![Optimization](https://img.shields.io/badge/Optimization-MCLP-orange)
-![Status](https://img.shields.io/badge/Status-Research%20Grade-success)
+A geospatial analytics and optimization platform for evaluating multimodal transit accessibility across the Hyderabad Metro network.
 
----
-
-## ⚡ TL;DR
-
-> A **research-grade, end-to-end system** that diagnoses and fixes last-mile connectivity gaps in urban metro systems using
-> **GTFS + Geospatial Modeling + Optimization + Route Design**
-
-📍 Case Study: Hyderabad Metro Red Line
-📊 Result: **+8.3% demand coverage uplift**, **+15.5% transit desert improvement** over standard models
+The platform integrates GTFS transit feeds, OpenStreetMap data, accessibility modeling, equity analysis, and optimization techniques to identify underserved areas and recommend high-impact interventions for improving last-mile connectivity.
 
 ---
 
-## 🧠 Why This Project Exists
+## Project Overview
 
-Most metro systems fail **not because of infrastructure — but because of access.**
+Urban transit systems often struggle with last-mile accessibility, where commuters face challenges reaching transit stations despite significant infrastructure investments.
 
-You can build a ₹20,000 crore metro…
-…but if people can’t reach the station → it’s useless.
+This project develops a data-driven framework to:
 
-This project answers:
+* Measure station-level accessibility
+* Detect transit deserts
+* Analyze temporal variations in service quality
+* Evaluate equity across different regions
+* Simulate intervention strategies
+* Prioritize high-impact improvements under resource constraints
 
-> ❓ *Where is connectivity failing?*
-> ❓ *When does it fail?*
-> ❓ *How do we fix it optimally under constraints?*
-
----
-
-## 🚀 What Makes This Different
-
-This is **NOT** another “EDA + ML notebook”.
-
-This is a **decision-support system** with:
-
-### 🔹 Temporal Intelligence
-
-* Captures **morning / midday / evening variability**
-* Uses **worst-case LMCI** → no masking of peak-hour failures
-
-### 🔹 Equity-Aware Optimization
-
-* Traditional models → serve high-demand areas
-* This model → **prioritizes underserved regions**
-
-### 🔹 Multimodal Thinking
-
-* Metro + Bus + MMTS + Feeder + Walkability
-* Real-world system modeling (not toy datasets)
-
-### 🔹 From Analysis → Action
-
-* Not just “insights”
-* Generates:
-
-  * ✅ feeder stop locations
-  * ✅ ranked feeder routes
-  * ✅ deployable strategies
+The Hyderabad Metro network is used as a real-world case study.
 
 ---
 
-## 🧮 Core Engine
+## Key Highlights
 
-### 📊 Last-Mile Connectivity Index (LMCI)
+* Analysis of 57 Hyderabad Metro stations
+* Integration of Metro, Bus, and MMTS transit networks
+* 14,000+ geospatial demand points
+* Temporal accessibility assessment
+* Equity-aware optimization framework
+* Interactive Streamlit dashboard
+* Research paper and reproducible methodology
 
-A composite accessibility metric:
+---
 
+## Methodology
+
+### 1. Data Integration
+
+The platform combines:
+
+* Hyderabad Metro Rail GTFS feeds
+* TGSRTC bus GTFS feeds
+* MMTS suburban rail GTFS feeds
+* OpenStreetMap business points of interest
+* Educational institution datasets
+* Feeder service information
+
+---
+
+### 2. Last-Mile Connectivity Index (LMCI)
+
+LMCI is a composite accessibility metric that incorporates:
+
+* Service frequency
 * Stop density
-* Service frequency (time-aware)
 * Walkability
+* Multimodal accessibility
 
-👉 Used to classify **Transit Deserts**
-
----
-
-### 🎯 Optimization Model
-
-> **Equity-Weighted Maximum Coverage Location Problem (MCLP)**
-
-* Budget constraint: `k feeder stops`
-* Objective: maximize **weighted demand coverage**
-* Bias: **low-LMCI zones get higher priority**
+The index enables station-level comparison and identification of accessibility gaps across the network.
 
 ---
 
-### 🧠 Key Insight
+### 3. Equity Assessment
 
-> Removing equity weighting → system collapses
+Accessibility is evaluated not only by demand coverage but also by service equity.
 
-| Model Variant | Coverage  | Desert Coverage |
-| ------------- | --------- | --------------- |
-| Full Model    | **71.6%** | **73.1%**       |
-| Standard MCLP | 62.7%     | 57.0%           |
-
-📉 That’s a **massive failure of naive optimization**
+The framework identifies underserved regions and highlights stations experiencing persistent accessibility disadvantages across different time periods.
 
 ---
 
-## 📊 Results (Real Findings)
+### 4. Optimization Framework
 
-### 🚨 Transit Desert Reality
+An Equity-Weighted Maximum Coverage Location Problem (MCLP) model is used to prioritize interventions.
 
-* Morning: **18 stations**
-* Midday: **14 stations**
-* Evening: **19 stations**
+The optimization framework:
 
-👉 Connectivity is a **peak-hour failure problem**
-
----
-
-### 📈 Coverage Performance
-
-* Full model consistently dominates baselines
-* Diminishing returns observed after k ≈ 7–8
-* Still **>1% marginal gain** per stop → efficient allocation
+* Maximizes demand coverage
+* Prioritizes low-accessibility areas
+* Supports constrained resource allocation
+* Generates intervention recommendations
 
 ---
 
-### 🏆 Top Strategy Insight
+### 5. Scenario Simulation
 
-> **MMTS-linked feeder routes outperform direct metro-only routes**
+The platform can simulate:
 
-Translation:
-👉 *Integration beats isolation*
-
----
-
-## 🗺️ System Outputs
-
-This pipeline generates:
-
-* 📊 LMCI rankings & heatmaps
-* 📉 Transit desert classification
-* 📈 Coverage curves (MCLP vs variants)
-* 🧪 Ablation studies
-* 🛣️ Ranked feeder routes
-* 🗺️ Spatial network visualizations
+* Feeder route additions
+* Multimodal integration strategies
+* Accessibility improvements
+* Coverage expansion scenarios
 
 ---
 
-## 🧱 Architecture Overview
+## Dashboard Features
 
-```
-GTFS + OSM Data
-        ↓
-Preprocessing & Cleaning
-        ↓
-Multimodal Network Graph
-        ↓
-Temporal Frequency Modeling
-        ↓
-LMCI Computation
-        ↓
-Transit Desert Detection
-        ↓
-Equity-Based MCLP Optimization
-        ↓
-Route Generation (DBSCAN + Heuristics)
-        ↓
-Evaluation (Coverage + Ablation)
-```
+The Streamlit application provides:
+
+* Network overview
+* LMCI analysis
+* Transit desert identification
+* Equity assessment
+* Optimization results
+* Scenario simulation
+* Interactive visualizations
 
 ---
 
-## 📂 Repository Structure
+## Repository Structure
 
-```bash
-├── data/
+```text
+.
+├── app.py
+├── config.yaml
+├── requirements.txt
+│
+├── Data/
 │   ├── hmrl/
 │   ├── tgsrtc/
 │   ├── mmts/
-│   └── feeder/
+│   ├── feeder/
+│   └── external/
 │
-├── visuals/              # All plots & maps
-├── cache/                # OSM cache
+├── src/
+│   ├── preprocessing.py
+│   ├── lmci.py
+│   ├── mclp.py
+│   ├── scoring.py
+│   ├── simulation.py
+│   └── visualization.py
 │
-├── notebook/
-│   └── main.ipynb
+├── assets/
+│   ├── plots
 │
-├── report/
-│   └── Project_Report.docx
-│
-└── README.md
+├── outputs/
+└── docs/
 ```
 
 ---
 
-## 🧪 Reproducibility
+## Installation
 
 ```bash
-pip install pandas geopandas matplotlib folium scipy shapely osmnx scikit-learn
+git clone https://github.com/pansuriyaForam/hyderabad-metro-last-mile-intelligence.git
+
+cd hyderabad-metro-last-mile-intelligence
+
+pip install -r requirements.txt
 ```
 
-Run notebook sequentially.
+---
 
-⚠️ Notes:
+## Running the Application
 
-* OSM graph download → slow on first run
-* Missing GTFS → fallback logic included
-* Fully deterministic (seeded pipeline)
+```bash
+streamlit run app.py
+```
 
 ---
 
-## ⚠️ Limitations
+## Research Contributions
 
-* No real-time traffic
-* Demand is approximated
-* Some walking distances approximated
-* Not field validated
+This work introduces:
 
-👉 This is a **planning intelligence layer**, not deployment
-
----
-
-## 💡 What You Should Take Away
-
-* Accessibility ≠ infrastructure
-* Peak hours reveal hidden failures
-* Equity-aware optimization is **non-negotiable**
-* Multimodal integration beats isolated planning
-* Data → Insight → Optimization → Action is the real pipeline
+* A multimodal Last-Mile Connectivity Index (LMCI)
+* Temporal accessibility assessment methodology
+* Equity-aware transit evaluation framework
+* Optimization-based intervention planning approach
+* Interactive decision-support platform for transit analysis
 
 ---
 
-## 🧭 Real-World Applications
+## Limitations
 
-* 🏙 Urban transport planning
-* 🚍 Feeder network design
-* 📊 Smart city analytics
-* 📍 Accessibility mapping
-* 🚦 Policy simulation
+* No real-time traffic integration
+* Demand approximations based on available datasets
+* Limited field validation
+* Static transit schedules
 
 ---
 
-## 🔥 Future Roadmap
+## Future Work
 
 * Real-time GTFS integration
-* Reinforcement learning for dynamic routing
-* Demand prediction using ML
-* Deployment as a web-based decision tool
+* Demand forecasting
+* Dynamic routing optimization
+* Multi-city benchmarking
+* Deployment as a planning intelligence platform
 
 ---
 
-## 🤝 Let’s Connect
+## Research Paper
 
-If you’re working on:
+**Title:** Temporal Equity Assessment and Optimization of Last-Mile Connectivity in Hyderabad Metro
 
-* Urban mobility
-* Optimization systems
-* Geo-AI
-* Smart cities
+**Status:** Manuscript in Preparation
 
-👉 This is exactly the space I’m building in.
+The repository will include the full paper upon completion.
 
 ---
 
-## ⭐ Final Note
+## Technologies Used
 
-If this project made you think:
+* Python
+* Pandas
+* GeoPandas
+* NumPy
+* Scikit-learn
+* SciPy
+* Folium
+* Matplotlib
+* Plotly
+* Streamlit
+* OpenStreetMap
+* GTFS
 
-> “Damn… this is actually useful”
+---
 
-Give it a ⭐ — it helps more than you think.
+## License
+
+This project is intended for research, educational, and urban mobility planning purposes.
