@@ -10,8 +10,9 @@ shapely>=2.0.0
 scipy>=1.10.0
 matplotlib>=3.7.0
 pyproj>=3.5.0
-fiona>=1.9.0
+# fiona>=1.9.0
 rtree>=1.0.0      # optional but recommended for geopandas performance
 
 # Configuration (used in some modules, though not directly imported)
 pyyaml>=6.0
+
